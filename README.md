@@ -192,7 +192,7 @@ traits_file    <- "example_traits.csv"
 
 If you use this pipeline, please cite:
 
-> Pandey RS. Brain DIA Proteomics Analysis Pipeline. GitHub: https://github.com/[your-username]/dia-proteomics-pipeline
+> Pandey RS. Brain DIA Proteomics Analysis Pipeline. GitHub: https://github.com/pandeyravi15/dia-proteomics-pipeline
 
 And the underlying tools:
 - [clusterProfiler](https://doi.org/10.1016/j.xinn.2021.100141)
@@ -216,4 +216,4 @@ MIT — see [LICENSE](LICENSE) for details.
 ## 📬 Contact
 
 **Ravi S Pandey**  
-GitHub: [@your-username](https://github.com/your-username)
+GitHub: [@pandeyravi15](https://github.com/pandeyravi15)
