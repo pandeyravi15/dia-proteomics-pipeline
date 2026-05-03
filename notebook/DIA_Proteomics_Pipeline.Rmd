@@ -21,12 +21,12 @@ knitr::opts_chunk$set(message = FALSE, warning = FALSE, error = FALSE, echo = FA
 
 ```{r user_config, echo=TRUE}
 # ── PATHS ─────────────────────────────────────────────────────────────────────
-data_dir       <- "../data/"           # Directory containing input data files
+data_dir       <- "../data/example"           # Directory containing input data files
 result_dir     <- "../results/"        # Directory to save output results
 
 # Input file names (place these in data_dir)
-abundance_file  <- "post_TAMPOR_cleanDat.csv"   # Normalized protein abundance matrix
-traits_file     <- "post_TAMPOR_traits.csv"     # Sample metadata / traits file
+abundance_file  <- "example_abundance.csv"   # Normalized protein abundance matrix
+traits_file     <- "example_traits.csv"     # Sample metadata / traits file
 
 # ── STUDY DESIGN ──────────────────────────────────────────────────────────────
 # Name of the control genotype (must match values in traits file exactly)
@@ -292,96 +292,17 @@ df <- abundance_with_traits %>%
 df[1:5, 1:9]
 ```
 
-```{r comparisons}
-# Auto-generate pairwise comparisons: each case vs control, stratified by sex and age
-comparisons <- expand.grid(
-  case_genotype = case_genotypes,
-  sex           = sex_levels,
-  age           = age_groups,
-  stringsAsFactors = FALSE
-) %>%
-  mutate(
-    control = paste0(control_genotype, "_", sex, "_", age, "M"),
-    case    = paste0(case_genotype,    "_", sex, "_", age, "M")
-  ) %>%
-  dplyr::select(control, case)
-
-comparisons
-```
-
-#### 4.2 ANOVA Function
-
-```{r DE_function}
-#' ANOVA with Tukey HSD post-hoc test
-#' @param data Data frame with traits and protein columns (proteins start at column 6)
-#' @return Data frame of F-values, p-values, adjusted p-values, and fold changes
-anova_DEG_SampleType <- function(data) {
-  # Remove columns where any group is entirely NA
-  cols_to_remove <- data %>%
-    group_by(SampleType) %>%
-    summarise(across(everything(), ~all(is.na(.x)))) %>%
-    ungroup() %>%
-    dplyr::select(-SampleType) %>%
-    summarise(across(everything(), ~any(.x))) %>%
-    pivot_longer(everything(), names_to = "col", values_to = "is_na") %>%
-    filter(is_na) %>%
-    pull(col)
-
-  df_cleaned <- data %>% dplyr::select(-any_of(cols_to_remove))
-
-  # Run ANOVA + Tukey for each protein
-  res_list <- lapply(6:ncol(df_cleaned), function(i) {
-    tryCatch({
-      aov_obj <- aov(df_cleaned[[i]] ~ SampleType, data = df_cleaned)
-      a_res   <- anova(aov_obj)
-      t_res   <- as.data.frame(TukeyHSD(aov_obj)$SampleType)
-      c(Protein = colnames(df_cleaned)[i],
-        F_Val = a_res$F[1], P_Val = a_res$Pr[1],
-        p_adj = t_res$`p adj`, diff = t_res$diff)
-    }, error = function(e) NULL)
-  })
-
-  final_df <- as.data.frame(do.call(rbind, res_list))
-  rownames(final_df) <- final_df$Protein
-  return(final_df[, -1])
-}
-```
-
-#### 4.3 Run Differential Abundance Analysis
-
-```{r run_DE, eval=FALSE}
-DE_results.df   <- data.frame()
-DE_results.list <- list()
-
-for (i in 1:nrow(comparisons)) {
-  data_subset <- df %>%
-    dplyr::filter(Group %in% unlist(comparisons[i, ])) %>%
-    dplyr::rename(SampleType = Group)
-
-  anova_results <- anova_DEG_SampleType(data_subset) %>%
-    as.data.frame()
-
-  for (j in 1:ncol(anova_results)) {
-    anova_results[, j] <- as.numeric(anova_results[, j])
-  }
-
-  anova_results <- anova_results %>%
-    tibble::rownames_to_column(var = "Symbol")
-
-  colnames(anova_results) <- c("Symbol", "F-Value", "Pr(>F)", "padj", "diff")
-
-  model_name <- paste0(comparisons[i, "case"], "_vs_", comparisons[i, "control"])
-
-  DE_results.df <- rbind(DE_results.df,
-                         anova_results %>% dplyr::mutate(model = model_name))
-  DE_results.list[[model_name]] <- anova_results
-}
-
+#### 4.2 Run DE
+```{r}
+comparisons  <- build_comparisons(df, control_genotype, case_genotypes, sex_levels, age_groups)
+anova_output <- run_anova_all_comparisons(df, comparisons)
+DE_results.list <- anova_output$results_list
+DE_results.df   <- anova_output$results_df
 save(DE_results.list, DE_results.df,
      file = file.path(result_dir, "ANOVA_Results_DIA_Proteomics.Rdata"))
 ```
 
-#### 4.4 Results Summary & Visualization
+#### 4.3 Results Summary & Visualization
 
 ```{r load_results}
 load(file.path(result_dir, "ANOVA_Results_DIA_Proteomics.Rdata"))
@@ -441,24 +362,16 @@ plot_protein_expression(male_degs,   proteins_of_interest_male,   "Males")
 
 ### Overlap of DAPs
 
-```{r upset_female, fig.width=9, fig.height=5}
+```{r upset_female, fig.width=9, fig.height=5,message=TRUE}
 significant_f <- female_degs %>% filter(padj < pval_cutoff)
-overlap.fn(unique(significant_f$model), significant_f)
-
-upset(fromList(all.up),   nsets = length(unique(significant_f$model)),
-      main.bar.color = "#164B6E", sets.x.label = "Total Upregulated Proteins",   order.by = "freq")
-upset(fromList(all.down), nsets = length(unique(significant_f$model)),
-      main.bar.color = "#85070C", sets.x.label = "Total Downregulated Proteins", order.by = "freq")
+safe_upset(significant_f, direction = "up",   bar_color = "#164B6E", x_label = "Upregulated Proteins")
+safe_upset(significant_f, direction = "down", bar_color = "#85070C", x_label = "Downregulated Proteins")
 ```
 
-```{r upset_male, fig.width=9, fig.height=5}
+```{r upset_male, fig.width=9, fig.height=5,message=TRUE}
 significant_m <- male_degs %>% filter(padj < pval_cutoff)
-overlap.fn(unique(significant_m$model), significant_m)
-
-upset(fromList(all.up),   nsets = length(unique(significant_m$model)),
-      main.bar.color = "#164B6E", sets.x.label = "Total Upregulated Proteins",   order.by = "freq")
-upset(fromList(all.down), nsets = length(unique(significant_m$model)),
-      main.bar.color = "#85070C", sets.x.label = "Total Downregulated Proteins", order.by = "freq")
+safe_upset(significant_m, direction = "up",   bar_color = "#164B6E", x_label = "Upregulated Proteins")
+safe_upset(significant_m, direction = "down", bar_color = "#85070C", x_label = "Downregulated Proteins")
 ```
 
 ### Volcano Plots
@@ -502,7 +415,7 @@ Over-representation analysis (ORA) and Gene Set Enrichment Analysis (GSEA) of di
 
 ### KEGG Enrichment — Females
 
-```{r kegg_female, fig.height=11, fig.width=11}
+```{r kegg_female, fig.height=11, fig.width=11,message=TRUE}
 dat_f <- female_degs %>%
   mutate(EntrezGene = AnnotationDbi::mapIds(
     get(organism_db),
@@ -522,7 +435,7 @@ kegg.fn(unique(DEG_f$group), DEG_f, n = top_pathways)
 
 ### KEGG Enrichment — Males
 
-```{r kegg_male, fig.height=11, fig.width=11}
+```{r kegg_male, fig.height=11, fig.width=11,message=TRUE}
 dat_m <- male_degs %>%
   mutate(EntrezGene = AnnotationDbi::mapIds(
     get(organism_db),
