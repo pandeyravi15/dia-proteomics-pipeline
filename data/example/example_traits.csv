@@ -1,0 +1,13 @@
+X,Sex,Genotype,Age
+S001,Female,Control,4
+S002,Male,Control,4
+S003,Female,Control,4
+S004,Male,Control,4
+S005,Female,CaseA,4
+S006,Male,CaseA,4
+S007,Female,CaseA,4
+S008,Male,CaseA,4
+S009,Female,CaseB,12
+S010,Male,CaseB,12
+S011,Female,CaseB,12
+S012,Male,CaseB,12

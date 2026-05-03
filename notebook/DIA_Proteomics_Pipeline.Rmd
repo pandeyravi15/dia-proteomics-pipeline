@@ -1,0 +1,549 @@
+---
+title: "Brain DIA Proteomics Analysis Pipeline"
+author: "Ravi S Pandey"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: united
+    highlight: tango
+    toc: true
+    toc_float: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, error = FALSE, echo = FALSE)
+```
+
+---
+
+## ⚙️ USER CONFIGURATION — Edit This Section Before Running
+
+```{r user_config, echo=TRUE}
+# ── PATHS ─────────────────────────────────────────────────────────────────────
+data_dir       <- "../data/"           # Directory containing input data files
+result_dir     <- "../results/"        # Directory to save output results
+
+# Input file names (place these in data_dir)
+abundance_file  <- "post_TAMPOR_cleanDat.csv"   # Normalized protein abundance matrix
+traits_file     <- "post_TAMPOR_traits.csv"     # Sample metadata / traits file
+
+# ── STUDY DESIGN ──────────────────────────────────────────────────────────────
+# Name of the control genotype (must match values in traits file exactly)
+control_genotype <- "Control_Genotype_Name"
+
+# Names of case/treatment genotypes (must match values in traits file exactly)
+case_genotypes <- c(
+  "Case_Genotype_1",
+  "Case_Genotype_2",
+  "Case_Genotype_3"
+)
+
+# Age groups in your study (numeric values as they appear in traits file)
+age_groups <- c(4, 12)   # e.g., c(4, 12) for 4-month and 12-month timepoints
+
+# Sex column values in traits file
+sex_levels <- c("Male", "Female")
+
+# ── SPECIES ───────────────────────────────────────────────────────────────────
+# Organism database for annotation (installed Bioconductor package)
+# Common options:
+#   Mouse: "org.Mm.eg.db"
+#   Human: "org.Hs.eg.db"
+#   Rat:   "org.Rn.eg.db"
+organism_db  <- "org.Mm.eg.db"
+kegg_organism <- "mmu"    # KEGG organism code: "mmu"=mouse, "hsa"=human, "rno"=rat
+
+# ── STATISTICAL THRESHOLDS ────────────────────────────────────────────────────
+pval_cutoff   <- 0.05     # Adjusted p-value cutoff for significance
+lfc_cutoff    <- 0        # Log2 fold-change cutoff (0 = any direction)
+top_pathways  <- 10       # Number of top pathways to display in enrichment plots
+
+# ── COLUMN NAME MAPPING ───────────────────────────────────────────────────────
+# Column names in your traits/metadata file
+col_sample_id  <- "X"          # Sample ID column
+col_sex        <- "Sex"        # Sex column
+col_genotype   <- "Genotype"   # Genotype column
+col_age        <- "Age"        # Age column
+
+# ── PROTEIN ID FORMAT ─────────────────────────────────────────────────────────
+# Does the ProteinID column contain pipe-delimited entries (Protein|Peptide)?
+# Set TRUE if raw DIA data has multiple peptide entries per protein
+has_peptide_suffix <- TRUE
+
+# ── OPTIONAL: CO-EXPRESSION MODULE CORRELATION ────────────────────────────────
+# Set to TRUE only if you have external reference module data
+run_module_correlation <- FALSE
+module_data_file <- ""    # Path to module reference data (.RData or .csv)
+
+# ── OPTIONAL: BIOLOGICAL DOMAIN ANALYSIS ─────────────────────────────────────
+# Set to TRUE only if you have biodomain annotation data
+run_biodomain_analysis <- FALSE
+biodomain_data_file <- ""  # Path to biodomain annotation data
+```
+
+---
+
+# {.tabset .tabset-fade}
+
+## Data Overview
+
+### 1. Experimental Design
+
+This document reports the processing of Brain DIA Proteomics data.
+
+**Study Groups:**
+
+- **Control:** `r control_genotype`
+- **Cases:** `r paste(case_genotypes, collapse = ", ")`
+- **Ages:** `r paste(age_groups, collapse = " and ")` months
+- **Sex:** `r paste(sex_levels, collapse = " and ")`
+
+**Analysis includes:**
+
+- Protein-level QC and normalization assessment
+- PCA for sample-level quality control
+- Differential abundance analysis (ANOVA + Tukey HSD)
+- KEGG pathway enrichment (ORA and GSEA)
+- Visualization: volcano plots, upset plots, barplots
+
+---
+
+### 2. Data Loading & Initial QC
+
+#### 2.1 Load Required Libraries
+
+```{r library, echo=TRUE}
+source("../R/Helper_Functions_Prot.R")
+```
+
+#### 2.2 Load & Format Metadata
+
+```{r metadata}
+# Load sample metadata
+trait_data <- read.csv(file.path(data_dir, traits_file)) %>%
+  dplyr::select(
+    ID         = !!col_sample_id,
+    Sex        = !!col_sex,
+    Genotype   = !!col_genotype,
+    Age        = !!col_age
+  ) %>%
+  # Keep only genotypes defined in config
+  filter(Genotype %in% c(control_genotype, case_genotypes))
+
+# Display sample summary table
+study_summary_table <- trait_data %>%
+  dplyr::count(Genotype, Age, Sex) %>%
+  pivot_wider(names_from = Sex, values_from = n, values_fill = 0) %>%
+  mutate(Age = factor(Age, levels = sort(age_groups))) %>%
+  arrange(Genotype, Age) %>%
+  gt() %>%
+  tab_header(
+    title    = md("**Study Population Summary**"),
+    subtitle = "Brain Proteomics (DIA)"
+  ) %>%
+  cols_label(Age = "Age Group") %>%
+  tab_style(
+    style     = cell_fill(color = "gray96"),
+    locations = cells_body(rows = Genotype == control_genotype)
+  ) %>%
+  grand_summary_rows(
+    columns = intersect(sex_levels, names(.)),
+    fns     = list(Total = ~sum(.)),
+    fmt     = list(~fmt_number(., decimals = 0))
+  ) %>%
+  tab_options(table.width = pct(80), column_labels.font.weight = "bold")
+
+study_summary_table
+```
+
+#### 2.3 Protein Abundance Matrix
+
+##### 2.3.1 Load Normalized Abundance Data
+
+> **Note on normalization:** The protein abundances should be pre-normalized before input. This pipeline assumes batch effects have been removed (e.g., via TAMPOR or similar). If raw data is provided, add a normalization step before proceeding. Proteins with >50% missing values per group are recommended to be excluded upstream.
+
+```{r QC1}
+# Load abundance data
+abundance_raw <- read.csv(
+  file.path(data_dir, abundance_file),
+  header     = TRUE,
+  row.names  = 1,
+  check.names = FALSE
+) %>%
+  rownames_to_column(var = "ProteinID")
+
+# Display dimensions
+cat("Dimensions:", dim(abundance_raw)[1], "proteins x", dim(abundance_raw)[2] - 1, "samples\n")
+abundance_raw[1:5, 1:6]
+```
+
+Check sample-level distribution with boxplot:
+
+```{r QC_boxplot, fig.width=14, fig.height=5}
+df_check <- abundance_raw %>% column_to_rownames(var = "ProteinID")
+boxplot(df_check, las = 2, main = "Sample Distributions (Post-Normalization)",
+        ylab = "Abundance", cex.axis = 0.6)
+```
+
+##### 2.3.2 Summarize to Protein Level
+
+```{r QC2}
+if (has_peptide_suffix) {
+  # Remove peptide suffixes (pipe-delimited format: Protein|Peptide)
+  expr_mat <- abundance_raw %>%
+    separate(col = ProteinID, into = c("Proteins", "Peptides"), sep = "[|]") %>%
+    filter(!(Proteins %in% "")) %>%
+    dplyr::select(-"Peptides")
+} else {
+  expr_mat <- abundance_raw %>% rename(Proteins = ProteinID)
+}
+
+# Collapse duplicates by averaging
+clean_abundance <- expr_mat %>%
+  group_by(Proteins) %>%
+  summarise(across(everything(), mean)) %>%
+  mutate(Proteins = str_to_title(Proteins)) %>%
+  column_to_rownames(var = "Proteins")
+
+cat("Final protein matrix:", nrow(clean_abundance), "proteins x", ncol(clean_abundance), "samples\n")
+clean_abundance[1:5, 1:5]
+```
+
+##### 2.3.3 Merge Traits with Abundance Data
+
+```{r combine}
+# Join traits with expression (long format)
+abundance_with_traits <- trait_data %>%
+  dplyr::select(animalName = ID, Genotype, Sex, Age) %>%
+  left_join(
+    clean_abundance %>%
+      t() %>%
+      as.data.frame() %>%
+      rownames_to_column(var = "animalName"),
+    by = "animalName"
+  )
+
+abundance_with_traits[1:5, 1:9]
+
+# Save processed data
+save(trait_data, clean_abundance, abundance_with_traits,
+     file = file.path(data_dir, "Processed_DIA_Proteomics.RData"))
+```
+
+---
+
+## PCA
+
+Principal component analysis (PCA) using probabilistic PCA to handle missing values.
+
+```{r PCA, fig.width=12, fig.height=6}
+load(file.path(data_dir, "Processed_DIA_Proteomics.RData"))
+library(pcaMethods)
+
+# Run probabilistic PCA (handles missing values)
+pc_obj    <- pca(t(clean_abundance), method = "ppca", nPcs = 2)
+pca_scores <- as.data.frame(scores(pc_obj)) %>%
+  rownames_to_column(var = "SampleID")
+
+# Join with metadata
+plot_df <- left_join(pca_scores, trait_data, by = c(SampleID = "ID"))
+
+# Plot
+ggplot(plot_df, aes(x = PC1, y = PC2, color = Genotype, shape = Sex)) +
+  geom_point(size = 3) +
+  geom_text(aes(label = Age), hjust = 0.5, vjust = 2.5, size = 3.5, show.legend = FALSE) +
+  theme_minimal() +
+  labs(title = "PCA — DIA Proteomics (PPCA)")
+```
+
+---
+
+## Differential Analysis Results {.tabset .tabset-fade}
+
+One-way ANOVA followed by Tukey HSD post-hoc tests to identify differentially abundant proteins. Analyses are stratified by sex and age.
+
+```{r load_data, echo=TRUE}
+load(file.path(data_dir, "Processed_DIA_Proteomics.RData"))
+```
+
+### ANOVA
+
+#### 4.1 Group Definition & Comparison Setup
+
+```{r group_definition}
+# Build all Genotype-Sex-Age combinations
+all_groups <- expand.grid(
+  Genotype = c(control_genotype, case_genotypes),
+  Sex      = sex_levels,
+  Age      = age_groups,
+  stringsAsFactors = FALSE
+) %>%
+  mutate(Group = paste0(Genotype, "_", Sex, "_", Age, "M"))
+
+# Add Group column to data
+df <- abundance_with_traits %>%
+  mutate(
+    Group = paste0(Genotype, "_", Sex, "_", Age, "M"),
+    .after = "Age"
+  ) %>%
+  mutate(Group = factor(Group, levels = all_groups$Group))
+
+df[1:5, 1:9]
+```
+
+```{r comparisons}
+# Auto-generate pairwise comparisons: each case vs control, stratified by sex and age
+comparisons <- expand.grid(
+  case_genotype = case_genotypes,
+  sex           = sex_levels,
+  age           = age_groups,
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    control = paste0(control_genotype, "_", sex, "_", age, "M"),
+    case    = paste0(case_genotype,    "_", sex, "_", age, "M")
+  ) %>%
+  dplyr::select(control, case)
+
+comparisons
+```
+
+#### 4.2 ANOVA Function
+
+```{r DE_function}
+#' ANOVA with Tukey HSD post-hoc test
+#' @param data Data frame with traits and protein columns (proteins start at column 6)
+#' @return Data frame of F-values, p-values, adjusted p-values, and fold changes
+anova_DEG_SampleType <- function(data) {
+  # Remove columns where any group is entirely NA
+  cols_to_remove <- data %>%
+    group_by(SampleType) %>%
+    summarise(across(everything(), ~all(is.na(.x)))) %>%
+    ungroup() %>%
+    dplyr::select(-SampleType) %>%
+    summarise(across(everything(), ~any(.x))) %>%
+    pivot_longer(everything(), names_to = "col", values_to = "is_na") %>%
+    filter(is_na) %>%
+    pull(col)
+
+  df_cleaned <- data %>% dplyr::select(-any_of(cols_to_remove))
+
+  # Run ANOVA + Tukey for each protein
+  res_list <- lapply(6:ncol(df_cleaned), function(i) {
+    tryCatch({
+      aov_obj <- aov(df_cleaned[[i]] ~ SampleType, data = df_cleaned)
+      a_res   <- anova(aov_obj)
+      t_res   <- as.data.frame(TukeyHSD(aov_obj)$SampleType)
+      c(Protein = colnames(df_cleaned)[i],
+        F_Val = a_res$F[1], P_Val = a_res$Pr[1],
+        p_adj = t_res$`p adj`, diff = t_res$diff)
+    }, error = function(e) NULL)
+  })
+
+  final_df <- as.data.frame(do.call(rbind, res_list))
+  rownames(final_df) <- final_df$Protein
+  return(final_df[, -1])
+}
+```
+
+#### 4.3 Run Differential Abundance Analysis
+
+```{r run_DE, eval=FALSE}
+DE_results.df   <- data.frame()
+DE_results.list <- list()
+
+for (i in 1:nrow(comparisons)) {
+  data_subset <- df %>%
+    dplyr::filter(Group %in% unlist(comparisons[i, ])) %>%
+    dplyr::rename(SampleType = Group)
+
+  anova_results <- anova_DEG_SampleType(data_subset) %>%
+    as.data.frame()
+
+  for (j in 1:ncol(anova_results)) {
+    anova_results[, j] <- as.numeric(anova_results[, j])
+  }
+
+  anova_results <- anova_results %>%
+    tibble::rownames_to_column(var = "Symbol")
+
+  colnames(anova_results) <- c("Symbol", "F-Value", "Pr(>F)", "padj", "diff")
+
+  model_name <- paste0(comparisons[i, "case"], "_vs_", comparisons[i, "control"])
+
+  DE_results.df <- rbind(DE_results.df,
+                         anova_results %>% dplyr::mutate(model = model_name))
+  DE_results.list[[model_name]] <- anova_results
+}
+
+save(DE_results.list, DE_results.df,
+     file = file.path(result_dir, "ANOVA_Results_DIA_Proteomics.Rdata"))
+```
+
+#### 4.4 Results Summary & Visualization
+
+```{r load_results}
+load(file.path(result_dir, "ANOVA_Results_DIA_Proteomics.Rdata"))
+head(DE_results.df)
+```
+
+```{r DEP_table, fig.width=10, fig.height=8}
+degs.up   <- map(DE_results.list, ~length(which(.x$padj < pval_cutoff & .x$diff > lfc_cutoff)))
+degs.down <- map(DE_results.list, ~length(which(.x$padj < pval_cutoff & .x$diff < -lfc_cutoff)))
+
+deg_summary <- data.frame(
+  comparison = names(degs.up),
+  Up         = as.integer(unlist(degs.up)),
+  Down       = as.integer(unlist(degs.down))
+)
+
+deg_summary %>%
+  mutate(Sex = ifelse(grepl("Female", comparison), "Female", "Male")) %>%
+  gt() %>%
+  tab_header(title = md(paste0("**DEPs at adjusted p < ", pval_cutoff, "**")))
+```
+
+```{r DEP_barplot, fig.width=10, fig.height=6}
+data_plot <- deg_summary %>%
+  mutate(Sex = ifelse(grepl("Female", comparison), "Female", "Male")) %>%
+  pivot_longer(cols = c(Up, Down), names_to = "Direction", values_to = "DEPs")
+
+ggplot(data_plot, aes(x = comparison, y = DEPs, fill = Direction)) +
+  geom_bar(stat = "identity", position = "dodge", color = "black", linewidth = 0.3) +
+  facet_wrap(~Sex, scales = "free_y") +
+  scale_fill_manual(values = c("Up" = "#D55E00", "Down" = "#0072B2")) +
+  labs(title = "Differentially Abundant Proteins (DAPs)",
+       subtitle = paste0("adjP < ", pval_cutoff, " | |Log2FC| > ", lfc_cutoff),
+       x = "", y = "Number of DAPs") +
+  theme_bw() +
+  theme(axis.text.x  = element_text(angle = 45, hjust = 1, size = 9),
+        plot.title   = element_text(hjust = 0.5, face = "bold"),
+        legend.position = "top")
+```
+
+#### 4.5 Expression of Selected Proteins
+
+Modify the protein list below to plot proteins of interest:
+
+```{r protein_plots, fig.width=12, fig.height=7}
+# ── USER: Change these protein names to your proteins of interest ──────────
+proteins_of_interest_female <- c("App", "Apoe")
+proteins_of_interest_male   <- c("App", "Mapt")
+# ──────────────────────────────────────────────────────────────────────────
+
+female_degs <- DE_results.df %>% filter(grepl("Female", model))
+male_degs   <- DE_results.df %>% filter(grepl("Male",   model))
+
+plot_protein_expression(female_degs, proteins_of_interest_female, "Females")
+plot_protein_expression(male_degs,   proteins_of_interest_male,   "Males")
+```
+
+### Overlap of DAPs
+
+```{r upset_female, fig.width=9, fig.height=5}
+significant_f <- female_degs %>% filter(padj < pval_cutoff)
+overlap.fn(unique(significant_f$model), significant_f)
+
+upset(fromList(all.up),   nsets = length(unique(significant_f$model)),
+      main.bar.color = "#164B6E", sets.x.label = "Total Upregulated Proteins",   order.by = "freq")
+upset(fromList(all.down), nsets = length(unique(significant_f$model)),
+      main.bar.color = "#85070C", sets.x.label = "Total Downregulated Proteins", order.by = "freq")
+```
+
+```{r upset_male, fig.width=9, fig.height=5}
+significant_m <- male_degs %>% filter(padj < pval_cutoff)
+overlap.fn(unique(significant_m$model), significant_m)
+
+upset(fromList(all.up),   nsets = length(unique(significant_m$model)),
+      main.bar.color = "#164B6E", sets.x.label = "Total Upregulated Proteins",   order.by = "freq")
+upset(fromList(all.down), nsets = length(unique(significant_m$model)),
+      main.bar.color = "#85070C", sets.x.label = "Total Downregulated Proteins", order.by = "freq")
+```
+
+### Volcano Plots
+
+```{r volcano, fig.height=8, fig.width=9}
+for (i in names(DE_results.list)) {
+  df_v <- DE_results.list[[i]] %>%
+    as.data.frame() %>%
+    mutate(log2FoldChange = as.numeric(diff), pvalue = as.numeric(padj))
+
+  print(
+    EnhancedVolcano(df_v,
+      x = "log2FoldChange", y = "pvalue",
+      lab = df_v$Symbol, title = i, subtitle = "",
+      FCcutoff = lfc_cutoff, pCutoff = pval_cutoff,
+      xlim = c(min(df_v$log2FoldChange, na.rm = TRUE) - 1,
+               max(df_v$log2FoldChange, na.rm = TRUE) + 1),
+      ylim = c(0, max(-log10(df_v$pvalue), na.rm = TRUE) + 2)
+    ) +
+      annotate("text",
+        x = min(df_v$log2FoldChange) / 2,
+        y = max(-log10(df_v$pvalue), na.rm = TRUE) + 1.5,
+        size = 5,
+        label = paste0("Down: ", nrow(filter(df_v, pvalue < pval_cutoff & log2FoldChange < 0)))
+      ) +
+      annotate("text",
+        x = max(df_v$log2FoldChange) / 2,
+        y = max(-log10(df_v$pvalue), na.rm = TRUE) + 1.5,
+        size = 5,
+        label = paste0("Up: ", nrow(filter(df_v, pvalue < pval_cutoff & log2FoldChange > 0)))
+      )
+  )
+}
+```
+
+---
+
+## Functional Analysis {.tabset .tabset-pills}
+
+Over-representation analysis (ORA) and Gene Set Enrichment Analysis (GSEA) of differentially abundant proteins against KEGG pathways using `clusterProfiler`.
+
+### KEGG Enrichment — Females
+
+```{r kegg_female, fig.height=11, fig.width=11}
+dat_f <- female_degs %>%
+  mutate(EntrezGene = AnnotationDbi::mapIds(
+    get(organism_db),
+    keys     = Symbol,
+    column   = "ENTREZID",
+    keytype  = "SYMBOL",
+    multiVals = "first"
+  ))
+
+DEG_f <- dat_f %>%
+  filter(padj < pval_cutoff) %>%
+  arrange(padj) %>%
+  dplyr::select(group = model, Symbol, EntrezGene, log2FoldChange = diff)
+
+kegg.fn(unique(DEG_f$group), DEG_f, n = top_pathways)
+```
+
+### KEGG Enrichment — Males
+
+```{r kegg_male, fig.height=11, fig.width=11}
+dat_m <- male_degs %>%
+  mutate(EntrezGene = AnnotationDbi::mapIds(
+    get(organism_db),
+    keys     = Symbol,
+    column   = "ENTREZID",
+    keytype  = "SYMBOL",
+    multiVals = "first"
+  ))
+
+DEG_m <- dat_m %>%
+  filter(padj < pval_cutoff) %>%
+  arrange(padj) %>%
+  dplyr::select(group = model, Symbol, EntrezGene, log2FoldChange = diff)
+
+kegg.fn(unique(DEG_m$group), DEG_m, n = top_pathways)
+```
+
+---
+
+## Session Info
+
+```{r session_info, echo=TRUE}
+sessionInfo()
+```
