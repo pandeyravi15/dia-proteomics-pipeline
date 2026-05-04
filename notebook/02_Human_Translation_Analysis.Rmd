@@ -1,0 +1,785 @@
+---
+title: "Human Translation Analysis — DIA Proteomics"
+author: "Ravi S Pandey"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: united
+    highlight: tango
+    toc: true
+    toc_float: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, error = FALSE, echo = FALSE)
+```
+
+> **Prerequisite:** Run `01_DIA_Proteomics_Pipeline.Rmd` first to generate
+> `ANOVA_Results_DIA_Proteomics.Rdata`, which this notebook loads as input.
+
+---
+
+## ⚙️ USER CONFIGURATION — Edit This Section Before Running
+
+```{r user_config, echo=TRUE}
+# ── PATHS ─────────────────────────────────────────────────────────────────────
+result_dir   <- "../results/"   # Must match result_dir in notebook 01
+data_dir     <- "../data/"
+
+# ── INPUT: ANOVA RESULTS FROM NOTEBOOK 01 ────────────────────────────────────
+anova_results_file <- "ANOVA_Results_DIA_Proteomics.Rdata"
+
+# ── HUMAN REFERENCE DATA ──────────────────────────────────────────────────────
+# Co-expression module reference (e.g., Emory TMT proteomics modules)
+# Expected columns: Symbol, Module, AD.Control
+module_data_file <- ""          # Path to module reference .RData or .csv
+
+# BioDomain reference files (from Agora / AMP-AD)
+# biodom_path: .rds file with GO_ID → Biodomain → Subdomain mapping
+# domain_colors_path: .csv with domain → color mapping
+biodom_path         <- ""       # e.g., "data/annotated_biodomains.rds"
+domain_colors_path  <- ""       # e.g., "data/domain_colors.csv"
+
+# ── SPECIES / ORGANISM ────────────────────────────────────────────────────────
+# Must match settings used in notebook 01
+organism_db  <- "org.Mm.eg.db"   # "org.Mm.eg.db" = mouse, "org.Hs.eg.db" = human
+
+# ── STATISTICAL THRESHOLDS ────────────────────────────────────────────────────
+pval_cutoff   <- 0.05    # Significance cutoff used in notebook 01
+lfc_cutoff    <- 0       # Log2FC cutoff used in notebook 01
+gsea_seed     <- 1111    # Random seed for GSEA reproducibility
+
+# ── ANALYSIS SWITCHES ─────────────────────────────────────────────────────────
+# Set to TRUE only if you have the corresponding reference data files above
+run_module_corr    <- FALSE   # Co-expression module correlation (ANOVA-based)
+run_biodomain_ora  <- FALSE   # GO-ORA with BioDomain annotation
+run_biodomain_gsea <- FALSE   # GO-GSEA with BioDomain annotation
+run_lm_analysis    <- FALSE   # Linear modeling + human module/biodomain correlation
+
+# ── PLOT DISPLAY OPTIONS ──────────────────────────────────────────────────────
+top_biodomains  <- 5     # Number of top biodomains to highlight in sub-domain plots
+nes_axis_limit  <- 3     # NES axis range for GSEA violin plots
+top_modules     <- 10    # Number of top modules to display in correlation plots
+
+# ── LINEAR MODEL CONFIGURATION ────────────────────────────────────────────────
+# Only used when run_lm_analysis <- TRUE
+#
+# The LM tests the effect of each genotype while controlling for covariates.
+# Formula: abundance ~ Genotype + Age + Sex  (or customize below)
+lm_formula <- "~ Genotype + Age + Sex"
+
+# Coefficient names to extract from the LM (must match factor levels in your data)
+# These are the genotype contrasts you want to report — typically your case genotypes
+# Example: c("(Intercept)", "GenotypeCaseA", "GenotypeCaseB", "Age", "SexMale")
+# Leave NULL to auto-detect all coefficients
+lm_coef_names <- NULL
+
+# Factor reference level for Genotype (will be set as the baseline in the LM)
+lm_reference_genotype <- control_genotype   # uses the value from above
+
+# ── MODEL ORDERING (for plots) ────────────────────────────────────────────────
+# Define the order in which models appear on plot axes.
+# Leave NULL to use alphabetical order.
+# Example: c("CaseA_Female_4M_vs_Control_Female_4M", ...)
+order_model_female <- NULL
+order_model_male   <- NULL
+
+# Variant order for LM plots (coefficient names in desired display order)
+# Leave NULL to use default order
+order_variant_lm <- NULL
+
+# ── LM VARIANT GROUPING ───────────────────────────────────────────────────────
+# Maps each LM coefficient (Variant) to a display group for faceting in plots.
+# Keys must exactly match coefficient names produced by your LM.
+# Leave NULL to skip grouping (plots will not be faceted by group).
+lm_variant_groups <- list(
+  "SexMale"          = "Covariate",
+  "Age"              = "Covariate",
+  "GenotypeCaseA_4M" = "Genotype Effects",
+  "GenotypeCaseB_4M" = "Genotype Effects"
+)
+
+# Factor order for groups in plots (controls facet order top to bottom)
+lm_group_order <- c("Genotype Effects", "Covariate")
+```
+
+```{r load_organism_db, echo=TRUE}
+# Load and resolve organism db — do this once here
+library(organism_db, character.only = TRUE)
+org_db_obj <- get(organism_db)
+```
+
+---
+
+```{r source_helpers}
+source("../R/Helper_Functions_Prot.R")
+```
+
+---
+
+# {.tabset .tabset-fade}
+
+## 1. Load Data
+
+### 1.1 Load ANOVA Results from Notebook 01
+
+```{r load_anova}
+anova_file <- file.path(result_dir, anova_results_file)
+
+if (!file.exists(anova_file))
+  stop(
+    "ANOVA results not found at: ", anova_file, "\n",
+    "Please run 01_DIA_Proteomics_Pipeline.Rmd first."
+  )
+
+load(anova_file)
+
+cat("Models loaded:", length(DE_results.list), "\n")
+cat("Total DEG rows:", nrow(DE_results.df), "\n")
+cat("Models:\n")
+cat(paste0("  - ", names(DE_results.list), collapse = "\n"), "\n")
+```
+
+### 1.2 Stratify by Sex
+
+```{r stratify}
+female_degs <- DE_results.df %>% dplyr::filter(grepl("Female", model))
+male_degs   <- DE_results.df %>% dplyr::filter(grepl("Male",   model))
+
+cat("Female comparisons:", length(unique(female_degs$model)), "\n")
+cat("Male comparisons:  ", length(unique(male_degs$model)),   "\n")
+```
+
+### 1.3 Add Entrez IDs
+
+```{r add_entrez}
+# Map gene symbols to Entrez IDs — done once outside mutate() to avoid scoping issues
+entrez_map_f <- map_symbols_to_entrez(female_degs$Symbol, org_db_obj)
+entrez_map_m <- map_symbols_to_entrez(male_degs$Symbol,   org_db_obj)
+
+female_degs <- female_degs %>%
+  dplyr::mutate(EntrezGene = entrez_map_f[Symbol])
+
+male_degs <- male_degs %>%
+  dplyr::mutate(EntrezGene = entrez_map_m[Symbol])
+
+# Mapping summary
+cat("Female — mapped:", sum(!is.na(female_degs$EntrezGene)),
+    "| missing:", sum(is.na(female_degs$EntrezGene)), "\n")
+cat("Male   — mapped:", sum(!is.na(male_degs$EntrezGene)),
+    "| missing:", sum(is.na(male_degs$EntrezGene)), "\n")
+```
+
+### 1.4 Filter to Significant DEPs
+
+```{r sig_deps}
+sig_female <- female_degs %>%
+  dplyr::filter(padj < pval_cutoff, abs(diff) > lfc_cutoff) %>%
+  dplyr::arrange(padj)
+
+sig_male <- male_degs %>%
+  dplyr::filter(padj < pval_cutoff, abs(diff) > lfc_cutoff) %>%
+  dplyr::arrange(padj)
+
+cat("Significant DEPs — Female:", nrow(sig_female),
+    "| Male:", nrow(sig_male), "\n")
+```
+
+---
+
+## 2. Co-expression Module Correlation {.tabset .tabset-pills}
+
+Pearson correlation between mouse model fold-changes and human AD brain
+proteomics co-expression module signatures. Significant correlations (p < 0.05)
+are highlighted with a black square overlay.
+
+```{r module_check}
+if (!run_module_corr) {
+  cat("Module correlation skipped.\n",
+      "Set run_module_corr <- TRUE and provide module_data_file to enable.\n")
+  knitr::knit_exit()
+}
+
+if (!file.exists(module_data_file))
+  stop("Module reference file not found at: ", module_data_file)
+
+load_module_refs(module_data_file)
+```
+
+### 2.1 Female — Module Correlation
+
+```{r module_corr_female, fig.width=12, fig.height=6, eval=run_module_corr}
+cor_female <- run_module_correlation(female_degs, human_ref = module_ref)
+
+if (!is.null(cor_female) && nrow(cor_female) > 0) {
+  plot_module_corrplot(
+    cor_data     = cor_female,
+    order_model  = order_model_female,
+    title        = "Human AD Module Correlation — Females"
+  )
+} else {
+  message("No module correlations computed for females (insufficient overlapping genes).")
+}
+```
+
+### 2.2 Male — Module Correlation
+
+```{r module_corr_male, fig.width=12, fig.height=6, eval=run_module_corr}
+cor_male <- run_module_correlation(male_degs, human_ref = module_ref)
+
+if (!is.null(cor_male) && nrow(cor_male) > 0) {
+  plot_module_corrplot(
+    cor_data     = cor_male,
+    order_model  = order_model_male,
+    title        = "Human AD Module Correlation — Males"
+  )
+} else {
+  message("No module correlations computed for males (insufficient overlapping genes).")
+}
+```
+
+### 2.3 Scatter — Top Modules Female
+
+```{r module_scatter_female, fig.width=12, fig.height=8, eval=run_module_corr}
+# Identify top significant modules for female
+if (!is.null(cor_female) && nrow(cor_female) > 0) {
+  top_mods_f <- cor_female %>%
+    dplyr::filter(significant) %>%
+    dplyr::arrange(p_value) %>%
+    dplyr::pull(Module) %>%
+    unique() %>%
+    head(top_modules)
+
+  if (length(top_mods_f) > 0) {
+    plot_module_scatter_correlations(
+      deg_df       = female_degs,
+      human_ref    = module_ref,
+      mods_to_plot = top_mods_f,
+      sex_label    = "Females"
+    )
+  } else {
+    message("No significant modules to plot for females.")
+  }
+}
+```
+
+### 2.4 Scatter — Top Modules Male
+
+```{r module_scatter_male, fig.width=12, fig.height=8, eval=run_module_corr}
+if (!is.null(cor_male) && nrow(cor_male) > 0) {
+  top_mods_m <- cor_male %>%
+    dplyr::filter(significant) %>%
+    dplyr::arrange(p_value) %>%
+    dplyr::pull(Module) %>%
+    unique() %>%
+    head(top_modules)
+
+  if (length(top_mods_m) > 0) {
+    plot_module_scatter_correlations(
+      deg_df       = male_degs,
+      human_ref    = module_ref,
+      mods_to_plot = top_mods_m,
+      sex_label    = "Males"
+    )
+  } else {
+    message("No significant modules to plot for males.")
+  }
+}
+```
+
+---
+
+## 3. BioDomain — GO Over-Representation Analysis {.tabset .tabset-pills}
+
+GO terms enriched in significantly differentially abundant proteins are mapped
+to AD biological domains (Agora/AMP-AD BioDomain framework). This identifies
+which disease-relevant biological processes are altered in each mouse model.
+
+```{r biodomain_check}
+if (!run_biodomain_ora) {
+  cat("BioDomain ORA skipped.\n",
+      "Set run_biodomain_ora <- TRUE and provide biodom_path and domain_colors_path to enable.\n")
+}
+```
+
+```{r load_biodomain_refs, eval=run_biodomain_ora}
+bd_refs <- load_biodomain_refs(biodom_path, domain_colors_path)
+bio_ref <- bd_refs$biodom
+lab_ref <- bd_refs$dom_lab
+```
+
+### 3.1 ORA — Females
+
+```{r ora_female, fig.width=14, fig.height=10, eval=run_biodomain_ora}
+if (nrow(sig_female) == 0) {
+  message("ORA skipped for females: no significant DEPs at padj < ", pval_cutoff)
+} else {
+  enr_ora_f <- enrichORA_BD_Protein(
+    dat         = sig_female,
+    bio_ref     = bio_ref,
+    lab_ref     = lab_ref,
+    org_db      = org_db_obj,
+    pval_cutoff = pval_cutoff
+  )
+
+  if (!is.null(enr_ora_f)) {
+    enr.ORA.bd_plot(enr_ora_f)
+  } else {
+    message("No enriched GO terms found for females.")
+  }
+}
+```
+
+### 3.2 ORA — Males
+
+```{r ora_male, fig.width=14, fig.height=10, eval=run_biodomain_ora}
+if (nrow(sig_male) == 0) {
+  message("ORA skipped for males: no significant DEPs at padj < ", pval_cutoff)
+} else {
+  enr_ora_m <- enrichORA_BD_Protein(
+    dat         = sig_male,
+    bio_ref     = bio_ref,
+    lab_ref     = lab_ref,
+    org_db      = org_db_obj,
+    pval_cutoff = pval_cutoff
+  )
+
+  if (!is.null(enr_ora_m)) {
+    enr.ORA.bd_plot(enr_ora_m)
+  } else {
+    message("No enriched GO terms found for males.")
+  }
+}
+```
+
+### 3.3 Sub-BioDomain ORA — Females
+
+```{r ora_sub_female, fig.width=14, fig.height=16, eval=run_biodomain_ora}
+if (!is.null(enr_ora_f) && nrow(enr_ora_f) > 0) {
+
+  # Select top biodomains by number of enriched terms
+  top_bd_f <- enr_ora_f %>%
+    dplyr::filter(Biodomain != "none") %>%
+    dplyr::count(Biodomain, sort = TRUE) %>%
+    head(top_biodomains) %>%
+    dplyr::pull(Biodomain)
+
+  sub_ora_f <- enr_ora_f %>%
+    dplyr::filter(Biodomain %in% top_bd_f)
+
+  if (nrow(sub_ora_f) > 0) {
+    plot_subdomain_distribution(
+      data  = sub_ora_f,
+      title = paste("Sub-BioDomain ORA — Females | Top", top_biodomains, "Domains")
+    )
+  } else {
+    message("No sub-domain data available for females.")
+  }
+}
+```
+
+### 3.4 Sub-BioDomain ORA — Males
+
+```{r ora_sub_male, fig.width=14, fig.height=16, eval=run_biodomain_ora}
+if (!is.null(enr_ora_m) && nrow(enr_ora_m) > 0) {
+
+  top_bd_m <- enr_ora_m %>%
+    dplyr::filter(Biodomain != "none") %>%
+    dplyr::count(Biodomain, sort = TRUE) %>%
+    head(top_biodomains) %>%
+    dplyr::pull(Biodomain)
+
+  sub_ora_m <- enr_ora_m %>%
+    dplyr::filter(Biodomain %in% top_bd_m)
+
+  if (nrow(sub_ora_m) > 0) {
+    plot_subdomain_distribution(
+      data  = sub_ora_m,
+      title = paste("Sub-BioDomain ORA — Males | Top", top_biodomains, "Domains")
+    )
+  } else {
+    message("No sub-domain data available for males.")
+  }
+}
+```
+
+---
+
+## 4. BioDomain — GSEA {.tabset .tabset-pills}
+
+Gene Set Enrichment Analysis using all proteins (ranked by fold-change),
+annotated with AD biological domains. Unlike ORA, GSEA uses the full ranked
+list and does not require a significance cutoff for gene selection.
+
+```{r gsea_check}
+if (!run_biodomain_gsea) {
+  cat("BioDomain GSEA skipped.\n",
+      "Set run_biodomain_gsea <- TRUE and provide biodom_path and domain_colors_path to enable.\n")
+}
+```
+
+### 4.1 GSEA — Females
+
+```{r gsea_female, fig.width=14, fig.height=10, eval=run_biodomain_gsea}
+enr_gsea_f <- enrichGSEA_BD_Protein(
+  dat     = female_degs,
+  bio_ref = bio_ref,
+  lab_ref = lab_ref,
+  org_db  = org_db_obj,
+  seed    = gsea_seed
+)
+
+if (!is.null(enr_gsea_f) && nrow(enr_gsea_f) > 0) {
+  plot_gsea_biodomain_distribution(enr_gsea_f, ran = nes_axis_limit)
+} else {
+  message("No GSEA results for females.")
+}
+```
+
+### 4.2 GSEA — Males
+
+```{r gsea_male, fig.width=14, fig.height=10, eval=run_biodomain_gsea}
+enr_gsea_m <- enrichGSEA_BD_Protein(
+  dat     = male_degs,
+  bio_ref = bio_ref,
+  lab_ref = lab_ref,
+  org_db  = org_db_obj,
+  seed    = gsea_seed
+)
+
+if (!is.null(enr_gsea_m) && nrow(enr_gsea_m) > 0) {
+  plot_gsea_biodomain_distribution(enr_gsea_m, ran = nes_axis_limit)
+} else {
+  message("No GSEA results for males.")
+}
+```
+
+### 4.3 Sub-BioDomain GSEA — Females
+
+```{r gsea_sub_female, fig.width=14, fig.height=16, eval=run_biodomain_gsea}
+if (!is.null(enr_gsea_f) && nrow(enr_gsea_f) > 0) {
+
+  top_bd_gsea_f <- enr_gsea_f %>%
+    dplyr::filter(Biodomain != "none", p.adjust < pval_cutoff) %>%
+    dplyr::count(Biodomain, sort = TRUE) %>%
+    head(top_biodomains) %>%
+    dplyr::pull(Biodomain)
+
+  sub_gsea_f <- enr_gsea_f %>%
+    dplyr::filter(Biodomain %in% top_bd_gsea_f)
+
+  if (nrow(sub_gsea_f) > 0) {
+    plot_gsea_subdomain_distribution(sub_gsea_f, ran = nes_axis_limit)
+  } else {
+    message("No significant sub-domain GSEA results for females.")
+  }
+}
+```
+
+### 4.4 Sub-BioDomain GSEA — Males
+
+```{r gsea_sub_male, fig.width=14, fig.height=16, eval=run_biodomain_gsea}
+if (!is.null(enr_gsea_m) && nrow(enr_gsea_m) > 0) {
+
+  top_bd_gsea_m <- enr_gsea_m %>%
+    dplyr::filter(Biodomain != "none", p.adjust < pval_cutoff) %>%
+    dplyr::count(Biodomain, sort = TRUE) %>%
+    head(top_biodomains) %>%
+    dplyr::pull(Biodomain)
+
+  sub_gsea_m <- enr_gsea_m %>%
+    dplyr::filter(Biodomain %in% top_bd_gsea_m)
+
+  if (nrow(sub_gsea_m) > 0) {
+    plot_gsea_subdomain_distribution(sub_gsea_m, ran = nes_axis_limit)
+  } else {
+    message("No significant sub-domain GSEA results for males.")
+  }
+}
+```
+
+---
+
+## 5. Linear Modeling + Human Correlation {.tabset .tabset-pills}
+
+Linear models test the effect of each genotype on protein abundance while
+controlling for covariates (Age, Sex). This is complementary to the ANOVA
+approach — ANOVA identifies pairwise differences, while LM estimates the
+independent contribution of each genotype across the full dataset.
+
+LM estimates are then correlated with human AD co-expression module signatures
+and AD biological domain (BioDomain) reference data to assess translational
+relevance.
+
+```{r lm_check}
+if (!run_lm_analysis) {
+  cat("Linear modeling skipped.\n",
+      "Set run_lm_analysis <- TRUE to enable.\n",
+      "Also ensure run_module_corr and/or run_biodomain_ora is TRUE for human correlation.\n")
+}
+```
+
+### 5.1 Run Linear Models
+
+```{r lm_run, eval=run_lm_analysis}
+# Load the abundance + traits data saved by notebook 01
+processed_file <- file.path(data_dir, "Processed_DIA_Proteomics.RData")
+if (!file.exists(processed_file))
+  stop("Processed data not found at: ", processed_file,
+       "\nPlease run 01_DIA_Proteomics_Pipeline.Rmd first.")
+
+load(processed_file)   # loads: trait_data, clean_abundance, abundance_with_traits
+
+# Set reference genotype level
+abundance_with_traits <- abundance_with_traits %>%
+  dplyr::mutate(
+    Genotype = relevel(factor(Genotype), ref = lm_reference_genotype),
+    Age      = as.numeric(Age),
+    Sex      = factor(Sex)
+  )
+
+# Build model formula
+formula_obj <- as.formula(paste("protein_col", lm_formula))
+
+# Identify protein columns (all numeric columns after metadata)
+meta_cols    <- c("animalName", "Genotype", "Sex", "Age", "Group")
+protein_cols <- setdiff(names(abundance_with_traits), meta_cols)
+protein_cols <- protein_cols[sapply(abundance_with_traits[protein_cols], is.numeric)]
+
+cat("Running linear models for", length(protein_cols), "proteins...\n")
+
+# Run LM for each protein
+lm_summaries <- lapply(setNames(protein_cols, protein_cols), function(prot) {
+  tryCatch({
+    formula_str <- paste0("`", prot, "`", lm_formula)
+    fit <- lm(as.formula(formula_str), data = abundance_with_traits)
+    summary(fit)
+  }, error = function(e) NULL)
+})
+
+# Remove failed models
+lm_summaries <- Filter(Negate(is.null), lm_summaries)
+cat("Successful models:", length(lm_summaries), "\n")
+
+# Auto-detect coefficient names if not specified
+if (is.null(lm_coef_names)) {
+  lm_coef_names <- rownames(lm_summaries[[1]]$coefficients)
+  cat("Auto-detected coefficients:\n")
+  cat(paste0("  - ", lm_coef_names, collapse = "\n"), "\n")
+}
+
+# Extract estimates and p-values
+lm_results <- extract_lm_stats(lm_summaries, coef_names = lm_coef_names)
+
+cat("\nLM results preview:\n")
+head(lm_results)
+```
+
+### 5.2 LM Results Summary
+
+```{r lm_summary_table, eval=run_lm_analysis}
+# Count significant variants per coefficient
+lm_sig_summary <- lm_results %>%
+  dplyr::group_by(Variant) %>%
+  dplyr::summarise(
+    Total_Proteins  = dplyr::n(),
+    Significant     = sum(P.Value < pval_cutoff, na.rm = TRUE),
+    Pct_Significant = round(100 * Significant / Total_Proteins, 1),
+    Mean_Abs_Est    = round(mean(abs(Estimate), na.rm = TRUE), 3),
+    .groups = "drop"
+  ) %>%
+  dplyr::filter(!grepl("Intercept", Variant)) %>%
+  dplyr::arrange(dplyr::desc(Significant))
+
+lm_sig_summary %>%
+  gt::gt() %>%
+  gt::tab_header(
+    title    = gt::md("**Linear Model Results Summary**"),
+    subtitle = gt::md(paste0("Significance threshold: p < ", pval_cutoff))
+  ) %>%
+  gt::cols_label(
+    Variant         = "Coefficient",
+    Total_Proteins  = "Total Proteins",
+    Significant     = "Significant (p<threshold)",
+    Pct_Significant = "% Significant",
+    Mean_Abs_Est    = "Mean |Estimate|"
+  ) %>%
+  gt::data_color(
+    columns = Pct_Significant,
+    method  = "numeric",
+    palette = c("white", "#164B6E")
+  ) %>%
+  gt::tab_options(table.width = gt::pct(80),
+                  column_labels.font.weight = "bold")
+```
+
+### 5.3 LM — Human Module Correlation
+
+```{r lm_module_corr, fig.width=14, fig.height=7, eval=run_lm_analysis}
+if (!run_module_corr) {
+  message("LM module correlation skipped — set run_module_corr <- TRUE and provide module_data_file.")
+} else {
+
+  lm_module_cor <- correlate_lm_with_human_modules(
+    lm_results      = lm_results,
+    human_ref       = pmod.AD.Control,
+    ordered_variant = order_variant_lm,
+    module_order    = NULL
+  ) 
+  
+  # Add group column from config if defined
+  if (!is.null(lm_variant_groups) && !is.null(lm_module_cor)) {
+    lm_module_cor <- lm_module_cor %>%
+      dplyr::mutate(
+        group = dplyr::recode(as.character(Variant), !!!lm_variant_groups,
+                              .default = "Other")
+      )
+
+    if (!is.null(lm_group_order)) {
+      lm_module_cor <- lm_module_cor %>%
+        dplyr::mutate(group = factor(group, levels = lm_group_order))
+    }
+  }
+
+  if (!is.null(lm_module_cor) && nrow(lm_module_cor) > 0) {
+    protein_variant_corrplot_test(lm_module_cor)
+  } else {
+    message("No LM-module correlations computed (insufficient overlapping genes).")
+  }
+}
+```
+
+### 5.4 LM — BioDomain Correlation
+
+```{r lm_biodomain_corr, fig.width=14, fig.height=7, eval=run_lm_analysis}
+if (!run_biodomain_ora) {
+  message("LM BioDomain correlation skipped — set run_biodomain_ora <- TRUE and provide biodom_path.")
+} else {
+
+  lm_biodom_cor <- corr_function_lm_biodomain(
+    data      = lm_results,
+    human_ref = bio_ref,
+    sig       = pval_cutoff
+  )
+
+  if (!is.null(lm_biodom_cor) && nrow(lm_biodom_cor) > 0) {
+    variant_corrplot_biodom(lm_biodom_cor)
+  } else {
+    message("No LM-BioDomain correlations computed (insufficient overlapping genes).")
+  }
+}
+```
+
+### 5.5 LM — Sub-BioDomain Correlation
+
+```{r lm_subbiodomain_corr, fig.width=14, fig.height=16, eval=run_lm_analysis}
+if (!run_biodomain_ora) {
+  message("LM Sub-BioDomain skipped — set run_biodomain_ora <- TRUE.")
+} else {
+
+  lm_subbiodom_cor <- corr_function_lm_subbiodomain(
+    lm_results = lm_results,
+    human_ref  = bio_ref,
+    sig        = pval_cutoff
+  )
+
+  if (!is.null(lm_subbiodom_cor) && nrow(lm_subbiodom_cor) > 0) {
+
+    # Select top biodomains by number of significant sub-domains
+    top_bd_lm <- lm_subbiodom_cor %>%
+      dplyr::filter(significant) %>%
+      dplyr::count(module, sort = TRUE) %>%
+      head(top_biodomains) %>%
+      dplyr::pull(module)
+
+    lm_sub_plot <- lm_subbiodom_cor %>%
+      dplyr::filter(module %in% top_bd_lm)
+
+    if (nrow(lm_sub_plot) > 0) {
+      variant_corrplot_subbiodom.Potrait(lm_sub_plot)
+    } else {
+      message("No significant sub-domain LM results to plot.")
+    }
+  } else {
+    message("No LM Sub-BioDomain correlations computed.")
+  }
+}
+```
+
+### 5.6 LM — Scatter: Top Modules
+
+```{r lm_module_scatter, fig.width=12, fig.height=8, eval=run_lm_analysis}
+if (!run_module_corr) {
+  message("LM module scatter skipped — set run_module_corr <- TRUE.")
+} else if (exists("lm_module_cor") && !is.null(lm_module_cor) && nrow(lm_module_cor) > 0) {
+
+  top_mods_lm <- lm_module_cor %>%
+    dplyr::filter(significant) %>%
+    dplyr::arrange(p_value) %>%
+    dplyr::pull(Module) %>%
+    unique() %>%
+    head(top_modules)
+
+  if (length(top_mods_lm) > 0) {
+    plot_module_effect_scatter_correlations(
+      deg_df       = lm_results,
+      human_ref    = module_ref,
+      mods_to_plot = top_mods_lm,
+      sex_label    = "LM Estimate"
+    )
+  } else {
+    message("No significant LM-module associations to plot.")
+  }
+}
+```
+
+---
+
+## 6. Save Results
+
+```{r save_results}
+# Collect all results that were computed
+results_to_save <- list()
+
+if (run_module_corr) {
+  results_to_save$module_cor_female <- cor_female
+  results_to_save$module_cor_male   <- cor_male
+}
+
+if (run_biodomain_ora) {
+  results_to_save$ora_female <- enr_ora_f
+  results_to_save$ora_male   <- enr_ora_m
+}
+
+if (run_biodomain_gsea) {
+  results_to_save$gsea_female <- enr_gsea_f
+  results_to_save$gsea_male   <- enr_gsea_m
+}
+
+if (run_lm_analysis) {
+  results_to_save$lm_results   <- lm_results
+  results_to_save$lm_summaries <- lm_sig_summary
+  if (exists("lm_module_cor"))    results_to_save$lm_module_cor    <- lm_module_cor
+  if (exists("lm_biodom_cor"))    results_to_save$lm_biodom_cor    <- lm_biodom_cor
+  if (exists("lm_subbiodom_cor")) results_to_save$lm_subbiodom_cor <- lm_subbiodom_cor
+}
+
+if (length(results_to_save) > 0) {
+  save(results_to_save,
+       file = file.path(result_dir, "Human_Translation_Results.Rdata"))
+  message("Results saved to: ", file.path(result_dir, "Human_Translation_Results.Rdata"))
+  cat("Objects saved:\n")
+  cat(paste0("  - ", names(results_to_save), collapse = "\n"), "\n")
+} else {
+  message("No results to save — all analysis switches are set to FALSE.")
+}
+```
+
+---
+
+## 7. Session Info
+
+```{r session_info, echo=TRUE}
+sessionInfo()
+```
