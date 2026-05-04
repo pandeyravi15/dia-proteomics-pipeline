@@ -1,0 +1,810 @@
+---
+title: "RNA-seq Human Translation Analysis"
+author: "Ravi S Pandey"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: united
+    highlight: tango
+    toc: true
+    toc_float: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, error = FALSE, echo = FALSE)
+```
+
+> **Prerequisite:** Run `03_RNAseq_Pipeline.Rmd` first to generate
+> `DESeq2_Results_RNAseq.RData` and `ProcessedData_RNAseq.RData`.
+
+---
+
+## ⚙️ USER CONFIGURATION — Edit This Section Before Running
+
+```{r user_config, echo=TRUE}
+# ── PATHS ─────────────────────────────────────────────────────────────────────
+data_dir   <- "../data/"
+result_dir <- "../results/"
+
+# Input files from notebook 03
+deseq2_file    <- "DESeq2_Results_RNAseq.RData"
+processed_file <- "ProcessedData_RNAseq.RData"
+
+# ── HUMAN REFERENCE DATA ──────────────────────────────────────────────────────
+# AMP-AD module data — combined (used for logFC correlation)
+# Expected to contain: ampad_modules_fc, module_clusters, mod
+ampad_module_file <- ""        # e.g., "data/AMPADModuleData.RData"
+
+# AMP-AD module data — sex-stratified (female/male separate)
+# Expected to contain: ampad_modules_fc.female, ampad_modules_fc.male
+ampad_sexwise_file <- ""       # e.g., "data/AMPAD_module_Sexwise.RData"
+
+# AD subtype data — Nikhil et al. (ROSMAP, Mayo, MSBB)
+# Expected to contain: ampad_subtype_fc, module_cohort, subtypes
+nikhil_subtype_file <- ""      # e.g., "data/Nikhil_SubtypeData.RData"
+
+# AD subtype data — Neff et al. (MSBB)
+# Expected to contain: neff_subtype_fc
+neff_subtype_file <- ""        # e.g., "data/Neff_Subtype.RData"
+
+# BioDomain reference files
+# biodom_path: mouse biodomain RDS (annotated_biodomains_mmus.rds)
+# biodom_rna: used for ORA/GSEA (mouse-specific annotations)
+biodom_path        <- ""       # e.g., "data/annotated_biodomains_mmus.rds"
+domain_colors_path <- ""       # e.g., "data/domain_colors.csv"
+
+# Human TREAT-AD omics scores (optional — for TE-based correlation)
+treat_ad_file <- ""            # e.g., "data/OmicsScores_TREATAD.csv"
+
+# ── ANALYSIS SWITCHES ─────────────────────────────────────────────────────────
+run_module_corr_fc    <- FALSE   # AMP-AD module correlation using DESeq2 logFC
+run_module_corr_lm    <- FALSE   # AMP-AD module correlation using LM estimates
+run_subtype_corr      <- FALSE   # AD subtype correlation (Nikhil + Neff)
+run_lm_analysis       <- FALSE   # Linear modeling on TPM data
+run_biodomain_ora     <- FALSE   # GO-ORA with BioDomain annotation
+run_biodomain_gsea    <- FALSE   # GO-GSEA with BioDomain annotation
+
+# ── STATISTICAL THRESHOLDS ────────────────────────────────────────────────────
+pval_cutoff   <- 0.05
+lfc_cutoff    <- 0
+nes_axis_limit <- 3
+
+# ── LINEAR MODEL CONFIGURATION ────────────────────────────────────────────────
+# Formula for LM: gene expression ~ covariates
+# Genotype dummy variables are created from case_genotypes below
+lm_formula <- "~ sex + Age + {case_dummies}"   # placeholder; built programmatically
+
+# Genotype names as they will appear in LM coefficients
+# These must match how R names them after dummy coding (e.g., paste0("Genotype", case))
+case_genotypes <- c("Case_Genotype_1", "Case_Genotype_2", "Case_Genotype_3")
+control_genotype <- "Control_Genotype_Name"
+
+# Age subsets for stratified LM (NULL = all samples together)
+lm_age_subsets <- list(
+  all  = NULL,   # NULL means use all samples
+  "4M" = 4,
+  "12M" = 12
+)
+
+# Readable labels for LM coefficients — used in plots
+# Keys must exactly match the coefficient names produced by your LM
+lm_term_labels <- c(
+  "(Intercept)" = "Intercept",
+  "sex"         = "Sex (Male)",
+  "Age12"       = "Age_12M"
+  # Add genotype terms here, e.g.:
+  # "IVS16"     = "Case_Genotype_1"
+)
+
+# Display order for variants in plots
+order_variant_lm <- NULL   # e.g., c("Sex (Male)", "Age_12M", "Case_Genotype_1")
+
+# Group mapping for faceting LM plots (Variant → group label)
+lm_variant_groups <- list(
+  "Sex (Male)" = "Covariate",
+  "Age_12M"    = "Covariate"
+  # Genotype terms → "Genotype Effects"
+)
+lm_group_order <- c("Genotype Effects", "Covariate")
+
+# ── PLOT OPTIONS ──────────────────────────────────────────────────────────────
+order_model_female <- NULL   # Factor order for female models in corrplots
+order_model_male   <- NULL   # Factor order for male models in corrplots
+top_biodomains     <- 5      # Top N biodomains for sub-domain plots
+```
+
+```{r source_helpers}
+source("../R/Helper_Functions.R")
+```
+
+---
+
+# {.tabset .tabset-fade}
+
+## 1. Load Data
+
+### 1.1 DESeq2 Results from Notebook 03
+
+```{r load_deseq2}
+deseq2_path <- file.path(result_dir, deseq2_file)
+if (!file.exists(deseq2_path))
+  stop("DESeq2 results not found at: ", deseq2_path,
+       "\nPlease run 03_RNAseq_Pipeline.Rmd first.")
+
+load(deseq2_path)
+cat("Comparisons loaded:", length(res_deseq$list), "\n")
+cat("Total DEG rows:", nrow(res_deseq$df), "\n")
+```
+
+### 1.2 Processed TPM Data from Notebook 03
+
+```{r load_processed}
+proc_path <- file.path(data_dir, processed_file)
+if (!file.exists(proc_path))
+  stop("Processed data not found at: ", proc_path,
+       "\nPlease run 03_RNAseq_Pipeline.Rmd first.")
+
+load(proc_path)   # loads: metadata_rna, rawcountdata, mydat_TPM
+cat("Samples in TPM matrix:", ncol(mydat_TPM), "\n")
+cat("Genes in TPM matrix:", nrow(mydat_TPM), "\n")
+```
+
+### 1.3 Load Human Reference Data
+
+```{r load_human_refs}
+# Load only the files that are needed by enabled analyses
+if (run_module_corr_fc || run_module_corr_lm) {
+  if (file.exists(ampad_module_file))  load(ampad_module_file)
+  if (file.exists(ampad_sexwise_file)) load(ampad_sexwise_file)
+}
+
+if (run_subtype_corr) {
+  if (file.exists(nikhil_subtype_file)) load(nikhil_subtype_file)
+  if (file.exists(neff_subtype_file))   load(neff_subtype_file)
+}
+
+if (run_biodomain_ora || run_biodomain_gsea) {
+  if (file.exists(biodom_path))
+    biodom_mouse <- readRDS(biodom_path)
+  if (file.exists(domain_colors_path))
+    dom.lab <- readr::read_csv(domain_colors_path, show_col_types = FALSE)
+}
+```
+
+### 1.4 Define Model Order
+
+```{r model_order}
+# Define display order for all models — update to match your comparisons
+all_models <- names(res_deseq$list)
+
+if (is.null(order_model_female))
+  order_model_female <- all_models[grepl("Female", all_models)]
+if (is.null(order_model_male))
+  order_model_male   <- all_models[grepl("Male", all_models)]
+
+cat("Female models:", length(order_model_female), "\n")
+cat("Male models:  ", length(order_model_male), "\n")
+```
+
+---
+
+## 2. AMP-AD Module Correlation — logFC {.tabset .tabset-pills}
+
+Pearson correlation between mouse DESeq2 log2 fold-changes and human AMP-AD
+co-expression module signatures. Black squares indicate p < 0.05.
+
+```{r module_fc_check}
+if (!run_module_corr_fc) {
+  cat("Module logFC correlation skipped.\n",
+      "Set run_module_corr_fc <- TRUE and provide ampad_module_file.\n")
+}
+```
+
+### 2.1 Female — Module logFC
+
+```{r corr_female_fc, fig.width=24, fig.height=6, eval=run_module_corr_fc}
+corr_res_female <- correlation_analysis(
+  mouse_res   = res_deseq$df %>% dplyr::filter(group %in% order_model_female),
+  human_data  = ampad_modules_fc.female,
+  module_meta = module_clusters,
+  mod_order   = mod,
+  sex_order   = order_model_female
+)
+
+if (!is.null(corr_res_female) && nrow(corr_res_female) > 0) {
+  magora_corrplot_colored(corr_res_female)
+} else {
+  message("No female module correlations computed.")
+}
+```
+
+### 2.2 Male — Module logFC
+
+```{r corr_male_fc, fig.width=24, fig.height=6, eval=run_module_corr_fc}
+corr_res_male <- correlation_analysis(
+  mouse_res   = res_deseq$df %>% dplyr::filter(group %in% order_model_male),
+  human_data  = ampad_modules_fc.male,
+  module_meta = module_clusters,
+  mod_order   = mod,
+  sex_order   = order_model_male
+)
+
+if (!is.null(corr_res_male) && nrow(corr_res_male) > 0) {
+  magora_corrplot_colored(corr_res_male)
+} else {
+  message("No male module correlations computed.")
+}
+```
+
+---
+
+## 3. Linear Modeling {.tabset .tabset-pills}
+
+Per-gene linear models on log2 TPM data, estimating the independent effect
+of each genotype variant while controlling for sex and age.
+
+```{r lm_check}
+if (!run_lm_analysis) {
+  cat("Linear modeling skipped.\n",
+      "Set run_lm_analysis <- TRUE to enable.\n")
+}
+```
+
+### 3.1 Run Linear Models
+
+```{r lm_run, eval=run_lm_analysis, echo=TRUE}
+metadata <- metadata_rna %>%
+  dplyr::mutate(
+    Genotype = factor(Genotype, levels = c(control_genotype, case_genotypes)),
+    Age      = factor(Age),
+    Names    = as.character(Names)
+  )
+
+# Build long-format data with dummy coding
+mydat_long <- mydat_TPM %>%
+  as.data.frame() %>%
+  dplyr::mutate(Gene = map_gene_ids(., "ENSEMBL", "SYMBOL")) %>%
+  tidyr::pivot_longer(cols = -Gene, names_to = "Names", values_to = "value") %>%
+  dplyr::filter(!is.na(Gene)) %>%
+  dplyr::left_join(metadata, by = "Names") %>%
+  dplyr::mutate(sex = as.numeric(Sex == "Male"))
+
+# Add dummy variables for each case genotype
+for (g in case_genotypes) {
+  col_name <- make.names(g)
+  mydat_long[[col_name]] <- as.numeric(mydat_long$Genotype == g)
+}
+
+# Build LM formula dynamically
+case_dummy_cols <- make.names(case_genotypes)
+lm_formula_str  <- paste0("value ~ sex + Age + ",
+                           paste(case_dummy_cols, collapse = " + "))
+cat("LM formula:", lm_formula_str, "\n")
+
+# Run LM for all samples
+run_lm_subset <- function(data, formula_str) {
+  data %>%
+    dplyr::group_by(Gene) %>%
+    tidyr::nest() %>%
+    dplyr::mutate(
+      model  = purrr::map(data, ~lm(as.formula(formula_str), data = .x)),
+      tidied = purrr::map(model, broom::tidy)
+    ) %>%
+    tidyr::unnest(tidied) %>%
+    dplyr::ungroup() %>%
+    dplyr::select(-data, -model) %>%
+    dplyr::mutate(term = dplyr::recode(term, !!!lm_term_labels))
+}
+
+lm_results_all <- run_lm_subset(mydat_long, lm_formula_str)
+
+# Run for each age subset
+lm_results_by_age <- list()
+for (age_label in names(lm_age_subsets)) {
+  age_val <- lm_age_subsets[[age_label]]
+  if (is.null(age_val)) next
+
+  sub_formula <- paste0("value ~ sex + ", paste(case_dummy_cols, collapse = " + "))
+  lm_results_by_age[[age_label]] <- run_lm_subset(
+    mydat_long %>% dplyr::filter(Age == age_val),
+    sub_formula
+  )
+  cat("LM completed for age:", age_label, "\n")
+}
+
+# Format for downstream functions
+format_lm_effects <- function(tidy_df) {
+  tidy_df %>%
+    dplyr::filter(term != "Intercept") %>%
+    dplyr::select(Gene, Variant = term, value = estimate, p.value)
+}
+
+rna_effects_all <- format_lm_effects(lm_results_all)
+rna_effects_by_age <- purrr::map(lm_results_by_age, format_lm_effects)
+
+save(rna_effects_all, rna_effects_by_age,
+     file = file.path(result_dir, "LM_Results_RNAseq.RData"))
+cat("LM results saved.\n")
+```
+
+```{r load_lm_results, eval=run_lm_analysis}
+load(file.path(result_dir, "LM_Results_RNAseq.RData"))
+```
+
+### 3.2 LM Summary
+
+```{r lm_summary, eval=run_lm_analysis}
+lm_sig <- rna_effects_all %>%
+  dplyr::group_by(Variant) %>%
+  dplyr::summarise(
+    Total       = dplyr::n(),
+    Significant = sum(p.value < pval_cutoff, na.rm = TRUE),
+    Pct_Sig     = round(100 * Significant / Total, 1),
+    Mean_Abs_Effect = round(mean(abs(value), na.rm = TRUE), 3),
+    .groups = "drop"
+  ) %>%
+  dplyr::filter(!grepl("Intercept", Variant)) %>%
+  dplyr::arrange(dplyr::desc(Significant))
+
+lm_sig %>%
+  gt::gt() %>%
+  gt::tab_header(
+    title    = gt::md("**Linear Model Summary**"),
+    subtitle = gt::md(paste0("Significance: p < ", pval_cutoff))
+  ) %>%
+  gt::data_color(columns = Pct_Sig, method = "numeric",
+                 palette = c("white", "#164B6E"))
+```
+
+---
+
+## 4. AMP-AD Module Correlation — LM Estimates {.tabset .tabset-pills}
+
+Pearson correlation between per-gene LM variant estimates and human AMP-AD
+module fold-changes.
+
+```{r module_lm_check}
+if (!run_module_corr_lm || !run_lm_analysis) {
+  cat("LM module correlation skipped.\n",
+      "Set run_module_corr_lm <- TRUE and run_lm_analysis <- TRUE.\n")
+}
+```
+
+### 4.1 All Samples
+
+```{r lm_corr_all, fig.width=20, fig.height=7,
+    eval=run_module_corr_lm && run_lm_analysis}
+
+lm_cor_all <- corr_function_lm(
+  data        = rna_effects_all %>% dplyr::select(Gene, Variant, value),
+  human_data  = ampad_modules_fc,
+  module_meta = module_clusters,
+  mod_order   = mod,
+  var_order   = order_variant_lm
+)
+
+# Add group column for faceting
+lm_cor_all <- lm_cor_all %>%
+  dplyr::mutate(
+    Background = dplyr::recode(as.character(Variant),
+                               !!!lm_variant_groups, .default = "Other"),
+    Background = factor(Background, levels = lm_group_order)
+  )
+
+if (nrow(lm_cor_all) > 0) {
+  ran <- ceiling(max(abs(range(lm_cor_all$correlation))) * 100) / 100
+  variant_corrplot_ggh4x(lm_cor_all, ran)
+} else {
+  message("No LM-module correlations found.")
+}
+```
+
+### 4.2 By Age Group
+
+```{r lm_corr_age, fig.width=20, fig.height=6,
+    eval=run_module_corr_lm && run_lm_analysis}
+for (age_label in names(rna_effects_by_age)) {
+  lm_cor_age <- corr_function_lm(
+    data        = rna_effects_by_age[[age_label]] %>%
+                  dplyr::select(Gene, Variant, value),
+    human_data  = ampad_modules_fc,
+    module_meta = module_clusters,
+    mod_order   = mod,
+    var_order   = order_variant_lm
+  ) %>%
+    dplyr::mutate(
+      Background = dplyr::recode(as.character(Variant),
+                                 !!!lm_variant_groups, .default = "Other"),
+      Background = factor(Background, levels = lm_group_order)
+    )
+
+  if (nrow(lm_cor_age) > 0) {
+    ran <- ceiling(max(abs(range(lm_cor_age$correlation))) * 100) / 100
+    print(variant_corrplot_ggh4x(lm_cor_age, ran) +
+            ggplot2::ggtitle(paste("LM Module Correlation —", age_label)))
+  }
+}
+```
+
+---
+
+## 5. AD Subtype Correlation {.tabset .tabset-pills}
+
+Correlation between mouse DESeq2 logFC values and human AD subtype signatures
+from Nikhil et al. (ROSMAP, Mayo, MSBB) and Neff et al. (MSBB).
+
+```{r subtype_check}
+if (!run_subtype_corr) {
+  cat("AD subtype correlation skipped.\n",
+      "Set run_subtype_corr <- TRUE and provide subtype data files.\n")
+}
+```
+
+### 5.1 Nikhil Subtypes — logFC
+
+```{r subtype_nikhil, fig.width=9, fig.height=8, eval=run_subtype_corr}
+order_all_models <- c(order_model_female, order_model_male)
+
+res_nikhil <- run_subtype_correlation(
+  load2_fc        = res_deseq$df,
+  target_data     = ampad_subtype_fc,
+  cohort_data     = module_cohort,
+  subtypes_levels = subtypes,
+  sex_levels      = order_all_models
+)
+
+if (!is.null(res_nikhil) && nrow(res_nikhil) > 0) {
+  ran <- ceiling(max(abs(range(res_nikhil$correlation))) * 100) / 100
+  subtype_FC_corrplot_colored(res_nikhil, ran)
+} else {
+  message("No Nikhil subtype correlations computed.")
+}
+```
+
+### 5.2 Neff Subtypes — logFC
+
+```{r subtype_neff, fig.width=8, fig.height=8, eval=run_subtype_corr}
+res_neff <- run_subtype_correlation(
+  load2_fc     = res_deseq$df,
+  target_data  = neff_subtype_fc,
+  sex_levels   = order_all_models,
+  cohort_data  = NULL,
+  custom_label = "MSBB_PHG_Neff"
+)
+
+if (!is.null(res_neff) && nrow(res_neff) > 0) {
+  ran <- ceiling(max(abs(range(res_neff$correlation))) * 100) / 100
+  subtype_FC_corrplot_colored(res_neff, ran)
+} else {
+  message("No Neff subtype correlations computed.")
+}
+```
+
+---
+
+## 6. BioDomain Correlation — LM Estimates {.tabset .tabset-pills}
+
+Correlation between per-gene LM variant estimates and AMP-AD biological domain
+reference fold-changes (biodom.data.FC and subbiodom.data.FC).
+
+```{r biodomain_lm_check}
+if (!run_lm_analysis || !run_biodomain_ora) {
+  cat("BioDomain LM correlation skipped.\n",
+      "Set run_lm_analysis <- TRUE and run_biodomain_ora <- TRUE.\n")
+}
+```
+
+### 6.1 BioDomain — All Samples
+
+```{r biodomain_all, fig.width=16, fig.height=7,
+    eval=run_lm_analysis && run_biodomain_ora}
+
+domain_order <- c(
+  "Apoptosis", "APP Metabolism", "Autophagy", "Cell Cycle", "DNA Repair",
+  "Endolysosome", "Epigenetic", "Immune Response", "Lipid Metabolism",
+  "Metal Binding and Homeostasis", "Mitochondrial Metabolism",
+  "Myelination", "Oxidative Stress", "Proteostasis", "RNA Spliceosome",
+  "Structural Stabilization", "Synapse", "Tau Homeostasis", "Vasculature"
+)
+
+df_lm <- rna_effects_all %>% dplyr::select(Gene, Variant, value)
+
+bd_all <- corr_function_lm_biodomain(
+  data           = df_lm,
+  ref            = biodom.data.FC,
+  sig            = pval_cutoff,
+  age_group_val  = "All Samples",
+  variant_levels = order_variant_lm,
+  domain_levels  = domain_order
+) %>%
+  dplyr::mutate(
+    group = dplyr::recode(as.character(Variant),
+                          !!!lm_variant_groups, .default = "Other"),
+    group = factor(group, levels = lm_group_order),
+    Name  = "Biological Domains"
+  )
+
+if (nrow(bd_all) > 0) {
+  ran <- ceiling(max(abs(range(bd_all$correlation))) * 100) / 100
+  variant_corrplot_biodom(bd_all, ran)
+} else {
+  message("No BioDomain LM correlations found.")
+}
+```
+
+### 6.2 Sub-BioDomain — All Samples
+
+```{r sub_biodomain_all, fig.width=12, fig.height=40,
+    eval=run_lm_analysis && run_biodomain_ora}
+
+sub_bd_all <- corr_function_lm_subbiodomain(
+  data           = df_lm,
+  ref            = subbiodom.data.FC,
+  sig            = pval_cutoff,
+  age_group_val  = "All Samples",
+  variant_levels = order_variant_lm,
+  domain_levels  = domain_order
+) %>%
+  dplyr::mutate(
+    group = dplyr::recode(as.character(Variant),
+                          !!!lm_variant_groups, .default = "Other"),
+    group = factor(group, levels = lm_group_order),
+    brain = "Biodomains_Treat-AD"
+  )
+
+if (nrow(sub_bd_all) > 0) {
+  variant_corrplot_subbiodom_portrait(sub_bd_all, ran = 1)
+} else {
+  message("No Sub-BioDomain LM correlations found.")
+}
+```
+
+### 6.3 Sub-BioDomain — By Age Group
+
+```{r sub_biodomain_age, fig.width=16, fig.height=7,
+    eval=run_lm_analysis && run_biodomain_ora}
+for (age_label in names(rna_effects_by_age)) {
+  df_age <- rna_effects_by_age[[age_label]] %>% dplyr::select(Gene, Variant, value)
+
+  sub_bd_age <- corr_function_lm_subbiodomain(
+    data           = df_age,
+    ref            = subbiodom.data.FC,
+    sig            = pval_cutoff,
+    age_group_val  = age_label,
+    variant_levels = order_variant_lm,
+    domain_levels  = domain_order
+  ) %>%
+    dplyr::mutate(
+      group = dplyr::recode(as.character(Variant),
+                            !!!lm_variant_groups, .default = "Other"),
+      group = factor(group, levels = lm_group_order)
+    )
+
+  if (nrow(sub_bd_age) > 0) {
+    print(variant_corrplot_subbiodom_portrait(sub_bd_age, ran = 1) +
+            ggplot2::ggtitle(paste("Sub-BioDomain —", age_label)))
+  }
+}
+```
+
+---
+
+## 7. GO — BioDomain ORA {.tabset .tabset-pills}
+
+GO over-representation analysis for differentially expressed genes, with
+results annotated to AMP-AD biological domains and sub-domains.
+
+```{r ora_check}
+if (!run_biodomain_ora) {
+  cat("BioDomain ORA skipped.\n",
+      "Set run_biodomain_ora <- TRUE and provide biodom_path.\n")
+}
+```
+
+```{r ora_run, eval=FALSE}
+# Run ORA — this is computationally intensive, run once and save
+univ_ids <- unique(as.data.frame(org.Mm.egGO)$gene_id)
+univ_mapped <- clusterProfiler::bitr(
+  univ_ids, fromType = "ENTREZID", toType = "SYMBOL",
+  OrgDb = org.Mm.eg.db, drop = TRUE
+)
+univ <- unique(univ_mapped$SYMBOL)
+
+enr_ora <- run_enrichment_pipeline(res_deseq$df, univ)
+save(enr_ora, file = file.path(result_dir, "ORA_BioDomain_RNAseq.RData"))
+cat("ORA results saved.\n")
+```
+
+```{r ora_load, eval=run_biodomain_ora}
+load(file.path(result_dir, "ORA_BioDomain_RNAseq.RData"))
+```
+
+### 7.1 BioDomain ORA — All Models
+
+```{r ora_plot, fig.width=12, fig.height=10, eval=run_biodomain_ora}
+enr_ora_plot <- enr_ora %>%
+  dplyr::filter(!(Biodomain %in% "none")) %>%
+  dplyr::mutate(model = factor(model, levels = rev(unique(model))))
+
+if (nrow(enr_ora_plot) > 0) {
+  ORA_plot_fn(enr_ora_plot)
+} else {
+  message("No BioDomain ORA results to plot.")
+}
+```
+
+### 7.2 Sub-BioDomain ORA
+
+```{r sub_ora_plot, fig.width=20, fig.height=22, eval=run_biodomain_ora}
+top_bd <- enr_ora_plot %>%
+  dplyr::filter(Biodomain != "none") %>%
+  dplyr::count(Biodomain, sort = TRUE) %>%
+  head(top_biodomains) %>%
+  dplyr::pull(Biodomain)
+
+sub_enr <- enr_ora_plot %>%
+  dplyr::filter(Biodomain %in% top_bd)
+
+if (nrow(sub_enr) > 0) {
+  plot_biodomain_distribution(sub_enr,
+    paste("Sub-BioDomain ORA — Top", top_biodomains, "Domains"))
+} else {
+  message("No sub-domain ORA results to plot.")
+}
+```
+
+---
+
+## 8. GO — BioDomain GSEA {.tabset .tabset-pills}
+
+GSEA using all genes ranked by log2 fold-change, annotated to AMP-AD
+biological domains. Unlike ORA, does not require a significance cutoff.
+
+```{r gsea_check}
+if (!run_biodomain_gsea) {
+  cat("BioDomain GSEA skipped.\n",
+      "Set run_biodomain_gsea <- TRUE and provide biodom_path.\n")
+}
+```
+
+```{r gsea_run, eval=FALSE}
+enr_gsea <- enrichGSEA_BD(
+  dat  = res_deseq$df,
+  set1 = unique(res_deseq$df$group)
+)
+save(enr_gsea, file = file.path(result_dir, "GSEA_BioDomain_RNAseq.RData"))
+cat("GSEA results saved.\n")
+```
+
+```{r gsea_load, eval=run_biodomain_gsea}
+load(file.path(result_dir, "GSEA_BioDomain_RNAseq.RData"))
+```
+
+### 8.1 BioDomain GSEA — Significant Terms
+
+```{r gsea_plot, fig.width=12, fig.height=9, eval=run_biodomain_gsea}
+gsea_sig <- enr_gsea %>%
+  dplyr::filter(p.adjust < 0.1, !(Biodomain %in% "none"))
+
+if (nrow(gsea_sig) > 0) {
+  plot_gsea_biodomain_distribution(gsea_sig, ran = nes_axis_limit)
+} else {
+  message("No significant GSEA terms (p.adjust < 0.1).")
+}
+```
+
+### 8.2 Sub-BioDomain GSEA — Females
+
+```{r gsea_sub_female, fig.width=16, fig.height=7, eval=run_biodomain_gsea}
+gsea_f <- enr_gsea %>%
+  dplyr::filter(grepl("Female", model), p.adjust < 0.4,
+                !(Biodomain %in% "none"))
+
+if (nrow(gsea_f) > 0) {
+  ggplot2::ggplot(gsea_f, ggplot2::aes(NES, Subdomain)) +
+    ggplot2::geom_violin(data = subset(gsea_f, NES > 0),
+                         ggplot2::aes(color = color), scale = "width") +
+    ggplot2::geom_violin(data = subset(gsea_f, NES < 0),
+                         ggplot2::aes(color = color), scale = "width") +
+    ggplot2::geom_jitter(ggplot2::aes(size = -log10(p.adjust), fill = color),
+                         color = "grey20", shape = 21, alpha = 0.3) +
+    ggplot2::geom_vline(xintercept = 0, lwd = 0.5, lty = 2) +
+    ggplot2::scale_y_discrete(drop = FALSE) +
+    ggplot2::scale_fill_identity() + ggplot2::scale_color_identity() +
+    ggplot2::ggtitle("Sub-BioDomain GSEA — Females") +
+    ggplot2::facet_grid(rows = dplyr::vars(abbr), cols = dplyr::vars(model),
+                        scales = "free", space = "free", switch = "y") +
+    ggplot2::theme_bw() +
+    ggplot2::theme(
+      strip.text.y.left = ggplot2::element_text(angle = 0, size = 12),
+      axis.text.x       = ggplot2::element_text(angle = 0, hjust = 0, size = 11),
+      axis.text.y       = ggplot2::element_text(size = 11)
+    )
+} else {
+  message("No female GSEA sub-domain results at p.adjust < 0.4.")
+}
+```
+
+### 8.3 Sub-BioDomain GSEA — Males
+
+```{r gsea_sub_male, fig.width=16, fig.height=10, eval=run_biodomain_gsea}
+gsea_m <- enr_gsea %>%
+  dplyr::filter(grepl("Male", model), p.adjust < 0.1,
+                !(Biodomain %in% "none"))
+
+if (nrow(gsea_m) > 0) {
+  ggplot2::ggplot(gsea_m, ggplot2::aes(NES, Subdomain)) +
+    ggplot2::geom_violin(data = subset(gsea_m, NES > 0),
+                         ggplot2::aes(color = color), scale = "width") +
+    ggplot2::geom_violin(data = subset(gsea_m, NES < 0),
+                         ggplot2::aes(color = color), scale = "width") +
+    ggplot2::geom_jitter(ggplot2::aes(size = -log10(p.adjust), fill = color),
+                         color = "grey20", shape = 21, alpha = 0.3) +
+    ggplot2::geom_vline(xintercept = 0, lwd = 0.5, lty = 2) +
+    ggplot2::scale_y_discrete(drop = FALSE) +
+    ggplot2::scale_fill_identity() + ggplot2::scale_color_identity() +
+    ggplot2::ggtitle("Sub-BioDomain GSEA — Males") +
+    ggplot2::facet_grid(rows = dplyr::vars(abbr), cols = dplyr::vars(model),
+                        scales = "free", space = "free", switch = "y") +
+    ggplot2::theme_bw() +
+    ggplot2::theme(
+      strip.text.y.left = ggplot2::element_text(angle = 0, size = 12),
+      axis.text.x       = ggplot2::element_text(angle = 0, hjust = 0, size = 11),
+      axis.text.y       = ggplot2::element_text(size = 11)
+    )
+} else {
+  message("No male GSEA sub-domain results at p.adjust < 0.1.")
+}
+```
+
+---
+
+## 9. Save Results
+
+```{r save_all}
+results_to_save <- list()
+
+if (run_module_corr_fc) {
+  results_to_save$module_corr_female_fc <- corr_res_female
+  results_to_save$module_corr_male_fc   <- corr_res_male
+}
+if (run_module_corr_lm && run_lm_analysis) {
+  results_to_save$lm_module_corr_all    <- lm_cor_all
+}
+if (run_subtype_corr) {
+  results_to_save$subtype_nikhil        <- res_nikhil
+  results_to_save$subtype_neff          <- res_neff
+}
+if (run_lm_analysis) {
+  results_to_save$lm_effects_all        <- rna_effects_all
+  results_to_save$lm_effects_by_age     <- rna_effects_by_age
+}
+if (run_biodomain_ora) {
+  results_to_save$ora_biodomain         <- enr_ora
+  if (exists("bd_all"))     results_to_save$lm_biodomain_all     <- bd_all
+  if (exists("sub_bd_all")) results_to_save$lm_subbiodomain_all  <- sub_bd_all
+}
+if (run_biodomain_gsea) {
+  results_to_save$gsea_biodomain        <- enr_gsea
+}
+
+if (length(results_to_save) > 0) {
+  save(results_to_save,
+       file = file.path(result_dir, "Human_Translation_RNAseq.RData"))
+  cat("Results saved to:",
+      file.path(result_dir, "Human_Translation_RNAseq.RData"), "\n")
+  cat("Objects saved:\n")
+  cat(paste0("  - ", names(results_to_save), collapse = "\n"), "\n")
+} else {
+  message("No results to save — all switches are FALSE.")
+}
+```
+
+---
+
+## Session Info
+
+```{r session_info, echo=TRUE}
+sessionInfo()
+```

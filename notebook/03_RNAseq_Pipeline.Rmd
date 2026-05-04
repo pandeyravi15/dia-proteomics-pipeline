@@ -1,0 +1,643 @@
+---
+title: "Brain RNA-seq Analysis Pipeline"
+author: "Ravi S Pandey"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: united
+    highlight: tango
+    toc: true
+    toc_float: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, error = FALSE, echo = FALSE)
+```
+
+---
+
+## ⚙️ USER CONFIGURATION — Edit This Section Before Running
+
+```{r user_config, echo=TRUE}
+# ── PATHS ─────────────────────────────────────────────────────────────────────
+data_dir   <- "../data/"
+result_dir <- "../results/"
+
+# Input file names (place these in data_dir)
+gene_counts_file    <- "rsem.merged.gene_counts.tsv"      # Raw gene count matrix
+gene_tpm_file       <- "rsem.merged.gene_tpm.tsv"         # TPM matrix
+isoform_tpm_file    <- "rsem.merged.transcript_tpm.tsv"   # Isoform TPM matrix
+metadata_file       <- "metadata_validated.csv"            # Sample metadata CSV
+
+# ── STUDY DESIGN ──────────────────────────────────────────────────────────────
+# Control genotype name (must match values in metadata Genotype/line column)
+control_genotype <- "Control_Genotype_Name"
+
+# Case genotype names (must match values in metadata Genotype/line column)
+case_genotypes <- c("Case_Genotype_1", "Case_Genotype_2", "Case_Genotype_3")
+
+# Age groups in study (numeric, as they appear in metadata)
+age_groups <- c(4, 12)
+
+# Sex levels
+sex_levels <- c("Female", "Male")
+
+# ── METADATA COLUMN MAPPING ───────────────────────────────────────────────────
+# Column names in your metadata CSV — adjust to match your file
+col_sample_id  <- "climbID"      # Unique sample identifier
+col_sex        <- "sex_climb"    # Sex column
+col_age        <- "age_m"        # Age column (numeric months)
+col_genotype   <- "line"         # Genotype/line column
+col_name       <- "sampleName"   # Optional sample name column
+
+# Age threshold for dichotomizing to timepoints (e.g., >10 months → 12M)
+age_threshold     <- 10
+age_above_thresh  <- 12
+age_below_thresh  <- 4
+
+# Sample IDs to exclude (e.g., failed QC, wrong genotype) — set to NULL if none
+samples_to_exclude <- NULL    # e.g., c(424862, 424866, 424858)
+
+# ── TRANSGENE HANDLING ────────────────────────────────────────────────────────
+# Set TRUE if your model has human transgenes that need to be merged with
+# their mouse orthologs before analysis (e.g., human MAPT + mouse Mapt)
+has_transgenes <- FALSE
+
+# If has_transgenes = TRUE, define the human→mouse Ensembl ID merge pairs.
+# Each entry: human_id will be summed into mouse_id, then human_id removed.
+# Example for MAPT: human ENSG00000186868 merged into mouse ENSMUSG00000018411
+transgene_merge_pairs <- list(
+  # list(human_id = "ENSG00000186868", mouse_id = "ENSMUSG00000018411")
+)
+
+# Ensembl IDs to drop entirely after merging (e.g., non-coding human transgenes)
+# Set to NULL if none
+transgene_ids_to_drop <- NULL   # e.g., "ENSG0"  (prefix match via %like%)
+
+# Gene IDs for transgene visualization (raw counts and TPM boxplots)
+transgene_viz_ids <- c()   # e.g., c("ENSG00000186868", "ENSMUSG00000018411")
+
+# ── ISOFORM ANALYSIS ──────────────────────────────────────────────────────────
+# Set TRUE only if you have isoform TPM data and want to visualize isoforms
+run_isoform_analysis <- FALSE
+
+# Human gene Ensembl ID whose isoforms to visualize (e.g., MAPT = ENSG00000186868)
+isoform_gene_id <- ""
+
+# Lookup table: Transcript ID → readable label
+# Example: c("ENST00000334239" = "ENST00000334239 (0N3R)", ...)
+isoform_lookup <- c()
+
+# ── SEX VALIDATION GENES ──────────────────────────────────────────────────────
+# Ensembl IDs for female-specific and male-specific genes to validate sex assignment
+sex_validation_ids <- c(
+  "ENSMUSG00000086503",   # Xist (female)
+  "ENSMUSG00000069045"    # Ddx3y (male)
+)
+sex_validation_labels <- c(
+  "ENSMUSG00000086503" = "Mouse Xist",
+  "ENSMUSG00000069045" = "Mouse Ddx3y"
+)
+
+# ── PRE-FILTERING THRESHOLDS ──────────────────────────────────────────────────
+tpm_min_count     <- 0.1    # Minimum TPM to count a gene as expressed
+tpm_min_samples   <- 5      # Minimum number of samples above tpm_min_count
+
+# ── SPECIES ───────────────────────────────────────────────────────────────────
+# Organism database for gene symbol mapping
+# Mouse: "org.Mm.eg.db" | Human: "org.Hs.eg.db" | Rat: "org.Rn.eg.db"
+organism_db  <- "org.Mm.eg.db"
+kegg_organism <- "mmu"        # "hsa" for human, "rno" for rat
+
+# ── DESEQ2 SETTINGS ───────────────────────────────────────────────────────────
+deseq2_alpha      <- 0.05    # Significance threshold for DESeq2 results()
+deseq2_min_count  <- 10      # Minimum row sum to retain a gene (pre-filter)
+deseq2_lfc_cutoff <- 0       # Log2FC threshold for DEG barplots/volcano
+
+# ── PCA SETTINGS ──────────────────────────────────────────────────────────────
+pca_ntop <- 1000    # Number of top variable genes for PCA
+pca_remove_xist <- TRUE  # Set TRUE to remove Xist (ENSMUSG00000086503) before PCA
+
+# ── KEGG SETTINGS ─────────────────────────────────────────────────────────────
+kegg_top_n    <- 15     # Number of top pathways to display
+kegg_pval_cutoff <- 0.05
+```
+
+```{r load_organism_db, echo=TRUE}
+# Load organism db — done once
+library(organism_db, character.only = TRUE)
+org_db_obj <- get(organism_db)
+```
+
+```{r source_helpers}
+source("../R/Helper_Functions.R")
+```
+
+---
+
+# {.tabset .tabset-fade}
+
+## 1. Data Inspection
+
+### 1.1 Study Overview
+
+> Data can be downloaded from the project Synapse page. Update paths in the
+> USER CONFIGURATION block before running.
+
+### 1.2 Load & Format Metadata
+
+```{r metadata, echo=TRUE}
+meta_raw <- read.csv(file.path(data_dir, metadata_file)) %>%
+  dplyr::distinct(.data[[col_sample_id]], .keep_all = TRUE)
+
+# Exclude failed QC samples if specified
+if (!is.null(samples_to_exclude)) {
+  meta_raw <- meta_raw %>%
+    dplyr::filter(!(.data[[col_sample_id]] %in% samples_to_exclude))
+}
+
+# Standardize column names and dichotomize age
+meta <- meta_raw %>%
+  dplyr::mutate(
+    Age = ifelse(.data[[col_age]] > age_threshold, age_above_thresh, age_below_thresh)
+  ) %>%
+  dplyr::select(
+    Names    = !!col_sample_id,
+    sampleName = dplyr::any_of(col_name),
+    Sex      = !!col_sex,
+    Age,
+    Genotype = !!col_genotype
+  ) %>%
+  dplyr::filter(Genotype %in% c(control_genotype, case_genotypes))
+
+# Study population summary
+dplyr::count(meta, Genotype, Age, Sex) %>%
+  tidyr::pivot_wider(names_from = Sex, values_from = n, values_fill = 0) %>%
+  gt::gt() %>%
+  gt::tab_header(title = gt::md("**Study Population**"))
+```
+
+### 1.3 Load Count Matrices
+
+```{r load_counts, echo=TRUE}
+gene_counts_raw <- readr::read_tsv(
+  file.path(data_dir, gene_counts_file), show_col_types = FALSE
+) %>%
+  dplyr::select(-dplyr::any_of("transcript_id(s)"))
+
+gene_tpm_raw <- readr::read_tsv(
+  file.path(data_dir, gene_tpm_file), show_col_types = FALSE
+) %>%
+  dplyr::select(-dplyr::any_of("transcript_id(s)"))
+
+cat("Raw count matrix:", nrow(gene_counts_raw), "genes x",
+    ncol(gene_counts_raw) - 1, "samples\n")
+```
+
+### 1.4 Transgene Inspection & Merging
+
+```{r transgene_inspect, eval=has_transgenes, fig.width=11, fig.height=10}
+# Plot raw counts for transgene genes of interest
+if (length(transgene_viz_ids) > 0) {
+  tg_plot <- gene_counts_raw %>%
+    dplyr::filter(gene_id %in% transgene_viz_ids) %>%
+    tidyr::pivot_longer(cols = -gene_id, names_to = "Names", values_to = "counts") %>%
+    dplyr::mutate(Names = as.integer(Names)) %>%
+    dplyr::left_join(meta, by = "Names")
+
+  ggplot2::ggplot(tg_plot, ggplot2::aes(x = Genotype, y = counts, fill = factor(Age))) +
+    ggplot2::geom_boxplot(ggplot2::aes(color = factor(Age)), alpha = 0.2,
+                          outlier.shape = NA) +
+    ggplot2::geom_point(ggplot2::aes(shape = Sex, color = factor(Age)),
+                        position = ggplot2::position_jitterdodge(
+                          jitter.width = 0.2, dodge.width = 0.75),
+                        alpha = 0.7, size = 2) +
+    ggplot2::facet_wrap(~gene_id, scales = "free_y") +
+    ggplot2::labs(x = "Genotype", y = "Raw Counts",
+                  title = "Transgene Expression — Raw Counts") +
+    ggplot2::theme_minimal() +
+    ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1))
+}
+```
+
+```{r transgene_merge, echo=TRUE}
+# Remove excluded samples from count matrix
+exclude_cols <- as.character(samples_to_exclude)
+
+gene_counts <- gene_counts_raw %>%
+  dplyr::select(-dplyr::any_of(exclude_cols)) %>%
+  tibble::column_to_rownames("gene_id")
+
+tpm_mat <- gene_tpm_raw %>%
+  dplyr::select(-dplyr::any_of(exclude_cols)) %>%
+  tibble::column_to_rownames("gene_id")
+
+# Merge human transgene counts into mouse orthologs
+if (has_transgenes && length(transgene_merge_pairs) > 0) {
+  for (pair in transgene_merge_pairs) {
+    gene_counts[pair$mouse_id, ] <-
+      gene_counts[pair$mouse_id, ] + gene_counts[pair$human_id, ]
+    gene_counts <- gene_counts[!rownames(gene_counts) %in% pair$human_id, ]
+
+    tpm_mat[pair$mouse_id, ] <-
+      tpm_mat[pair$mouse_id, ] + tpm_mat[pair$human_id, ]
+    tpm_mat <- tpm_mat[!rownames(tpm_mat) %in% pair$human_id, ]
+  }
+  cat("Transgene merging complete.\n")
+}
+
+# Drop any remaining human/unwanted genes by prefix
+if (!is.null(transgene_ids_to_drop)) {
+  keep_rows <- !grepl(paste0("^", transgene_ids_to_drop), rownames(gene_counts))
+  gene_counts <- gene_counts[keep_rows, ]
+  tpm_mat     <- tpm_mat[keep_rows, ]
+  cat("Dropped genes matching prefix:", transgene_ids_to_drop, "\n")
+}
+
+cat("Final count matrix:", nrow(gene_counts), "genes x", ncol(gene_counts), "samples\n")
+```
+
+### 1.5 Sex Validation
+
+```{r sex_validation, fig.width=9, fig.height=4}
+if (length(sex_validation_ids) > 0) {
+  sex_val <- tpm_mat %>%
+    tibble::rownames_to_column("gene_id") %>%
+    dplyr::filter(gene_id %in% sex_validation_ids) %>%
+    tidyr::pivot_longer(cols = -gene_id, names_to = "Names", values_to = "tpm") %>%
+    dplyr::mutate(Names = as.integer(Names)) %>%
+    dplyr::left_join(meta, by = "Names") %>%
+    dplyr::mutate(
+      Age    = factor(Age, levels = age_groups),
+      symbol = dplyr::recode(gene_id, !!!sex_validation_labels)
+    )
+
+  ggplot2::ggplot(sex_val, ggplot2::aes(x = Sex, y = tpm,
+                                         color = factor(Age), shape = Genotype)) +
+    ggplot2::geom_boxplot() +
+    ggplot2::geom_point(position = ggplot2::position_jitterdodge()) +
+    ggplot2::facet_wrap(~symbol, scales = "free") +
+    ggplot2::theme_bw() +
+    ggplot2::labs(title = "Sex Validation — Xist (F) and Ddx3y (M)", color = "Age")
+}
+```
+
+### 1.6 Zero Count Filtering Summary
+
+```{r zero_filter}
+gene_sums <- data.frame(
+  gene_id = rownames(gene_counts),
+  sums    = Matrix::rowSums(gene_counts)
+)
+cat("Genes with zero counts across all samples:",
+    sum(gene_sums$sums == 0), "\n")
+cat("These will be removed by DESeq2 pre-filtering.\n")
+```
+
+### 1.7 Pre-filter & Save Processed Data
+
+```{r prefilter, eval=FALSE, echo=TRUE}
+# TPM-based pre-filtering and log2 transformation
+TPMcount.filter <- tpm_mat[rowSums(tpm_mat > tpm_min_count) > tpm_min_samples, ]
+rawcountdata    <- gene_counts[, as.character(meta$Names)]
+mydat_TPM       <- as.data.frame(log2(
+  TPMcount.filter[, as.character(meta$Names)] + 1
+))
+
+# Format metadata for DESeq2
+metadata_rna <- as.data.frame(meta)
+rownames(metadata_rna) <- metadata_rna$Names
+
+save(metadata_rna, rawcountdata, mydat_TPM,
+     file = file.path(data_dir, "ProcessedData_RNAseq.RData"))
+cat("Processed data saved.\n")
+```
+
+---
+
+## 2. Isoform Expression
+
+```{r isoform_check}
+if (!run_isoform_analysis) {
+  cat("Isoform analysis skipped.\n",
+      "Set run_isoform_analysis <- TRUE and provide isoform_gene_id and isoform_lookup to enable.\n")
+}
+```
+
+```{r isoform_load, eval=run_isoform_analysis}
+load(file.path(data_dir, "ProcessedData_RNAseq.RData"))
+
+tpm_isoform <- read.delim2(
+  file.path(data_dir, isoform_tpm_file), check.names = FALSE
+)
+
+isodata_meta <- tpm_isoform %>%
+  dplyr::filter(gene_id == isoform_gene_id) %>%
+  dplyr::select(-gene_id) %>%
+  tidyr::pivot_longer(cols = -transcript_id, names_to = "Names", values_to = "TPM") %>%
+  dplyr::mutate(
+    Names  = as.numeric(Names),
+    TPM    = as.numeric(TPM),
+    logTPM = log2(TPM + 1),
+    logTPM = ifelse(is.infinite(logTPM) | is.na(logTPM), 0, logTPM)
+  ) %>%
+  dplyr::inner_join(
+    metadata_rna %>%
+      dplyr::mutate(Group = paste0(Genotype, "_", Sex, "_", Age, "M")),
+    by = "Names"
+  )
+```
+
+### 2.1 Selected Isoforms
+
+```{r isoform_plot_selected, fig.width=18, fig.height=12, eval=run_isoform_analysis}
+if (length(isoform_lookup) > 0) {
+  df_plot <- isodata_meta %>%
+    dplyr::filter(transcript_id %in% names(isoform_lookup)) %>%
+    dplyr::mutate(
+      transcript_label = factor(isoform_lookup[transcript_id],
+                                levels = isoform_lookup)
+    )
+
+  # Calculate group means for text labels
+  means_df <- df_plot %>%
+    dplyr::group_by(Group, transcript_label) %>%
+    dplyr::summarise(mean_val = round(mean(logTPM), 2), .groups = "drop")
+
+  ggplot2::ggplot(df_plot, ggplot2::aes(x = Group, y = logTPM, fill = Group)) +
+    ggplot2::geom_dotplot(binaxis = "y", stackdir = "center", binwidth = 1/3) +
+    ggplot2::stat_summary(fun.data = mean_sdl, fun.args = list(mult = 1),
+                          geom = "errorbar", width = 0.2) +
+    ggplot2::stat_summary(fun = mean, geom = "point", size = 2) +
+    ggplot2::geom_text(data = means_df,
+                       ggplot2::aes(y = mean_val + 0.5, label = mean_val),
+                       size = 3, hjust = 0.5) +
+    ggplot2::facet_wrap(~transcript_label, ncol = 3) +
+    ggplot2::labs(title = paste("Isoforms of", isoform_gene_id),
+                  y = "Expression (log2 TPM)", x = "") +
+    ggplot2::theme_bw(base_size = 14) +
+    ggplot2::theme(
+      plot.title   = ggplot2::element_text(hjust = 0.5, face = "bold"),
+      axis.text.x  = ggplot2::element_text(angle = 90, hjust = 1, face = "bold"),
+      strip.text   = ggplot2::element_text(size = 12, face = "bold"),
+      legend.position = "none"
+    )
+}
+```
+
+---
+
+## 3. Principal Component Analysis
+
+```{r load_for_pca}
+load(file.path(data_dir, "ProcessedData_RNAseq.RData"))
+```
+
+### 3.1 DESeq2 VST PCA
+
+```{r pca_deseq2, fig.width=10, fig.height=8}
+dds_pca <- DESeq2::DESeqDataSetFromMatrix(
+  countData = as.matrix(rawcountdata),
+  colData   = metadata_rna,
+  design    = as.formula(paste0("~ Genotype"))
+)
+dds_pca <- dds_pca[rowSums(DESeq2::counts(dds_pca) > 1) >= 6, ]
+dds_pca <- DESeq2::DESeq(dds_pca, parallel = TRUE)
+vsd     <- DESeq2::varianceStabilizingTransformation(dds_pca, blind = FALSE)
+vsd_mat <- DESeq2::assay(vsd)
+
+# Optionally remove Xist before PCA (avoids sex dominating PC1)
+if (pca_remove_xist) {
+  vsd_mat <- vsd_mat[!rownames(vsd_mat) %in% "ENSMUSG00000086503", ]
+}
+
+pca_df      <- plotPCA.df(vsd_mat, metadata = metadata_rna,
+                           intgroup = c("Names", "Genotype", "Age", "Sex"),
+                           returnData = TRUE, ntop = pca_ntop)
+percent_var <- round(100 * attr(pca_df, "percentVar"))
+
+# Plot 1: Genotype + Sex
+ggplot2::ggplot(pca_df, ggplot2::aes(x = PC1, y = PC2,
+                                      color = Genotype, shape = Sex)) +
+  ggplot2::geom_point(size = 4, alpha = 0.8) +
+  ggplot2::geom_text(ggplot2::aes(label = Age), hjust = 0.5, vjust = 2.5,
+                     size = 3.5, show.legend = FALSE) +
+  ggplot2::labs(
+    x = paste0("PC1: ", percent_var[1], "% variance"),
+    y = paste0("PC2: ", percent_var[2], "% variance"),
+    title = "PCA — Variance Stabilized Counts",
+    subtitle = paste0("Top ", pca_ntop, " variable genes")
+  ) +
+  ggplot2::theme_bw(base_size = 16) +
+  ggplot2::theme(
+    plot.title    = ggplot2::element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = ggplot2::element_text(hjust = 0.5),
+    axis.text     = ggplot2::element_text(face = "bold", color = "black"),
+    legend.position = "right",
+    panel.grid.minor = ggplot2::element_blank()
+  ) +
+  ggplot2::scale_color_brewer(palette = "Set1")
+```
+
+```{r pca_age_sex, fig.width=10, fig.height=8}
+# Plot 2: Age + Genotype
+ggplot2::ggplot(pca_df, ggplot2::aes(x = PC1, y = PC2,
+                                      color = factor(Age), shape = Genotype)) +
+  ggplot2::geom_point(size = 3) +
+  ggplot2::geom_text(ggplot2::aes(label = Names), hjust = 0.5, vjust = 2,
+                     size = 3.5) +
+  ggplot2::labs(
+    x = paste0("PC1: ", percent_var[1], "% variance"),
+    y = paste0("PC2: ", percent_var[2], "% variance"),
+    color = "Age (months)"
+  ) +
+  ggplot2::theme_bw(base_size = 16) +
+  ggplot2::theme(panel.grid.minor = ggplot2::element_blank())
+```
+
+### 3.2 PCAtools Biplot + Eigencor
+
+```{r pca_tools, fig.width=9, fig.height=6}
+key <- metadata_rna[colnames(mydat_TPM), ]
+p   <- PCAtools::pca(mydat_TPM, metadata = key, removeVar = 0.1)
+
+PCAtools::biplot(p, colby = "Genotype", shape = "Sex",
+                 legendPosition = "right", title = "PCA biplot — TPM",
+                 lab = p$metadata$Age, drawConnectors = FALSE)
+
+PCAtools::eigencorplot(p, metavars = c("Genotype", "Age", "Sex"))
+```
+
+### 3.3 Final Study Population
+
+```{r final_population}
+dplyr::count(metadata_rna, Genotype, Age, Sex) %>%
+  tidyr::pivot_wider(names_from = Sex, values_from = n, values_fill = 0) %>%
+  gt::gt() %>%
+  gt::tab_header(title = gt::md("**Final Study Population**"))
+```
+
+---
+
+## 4. Differential Expression Analysis
+
+### 4.1 Setup Comparisons
+
+```{r deseq2_setup, echo=TRUE}
+load(file.path(data_dir, "ProcessedData_RNAseq.RData"))
+
+metadata <- metadata_rna %>%
+  dplyr::mutate(
+    Genotype = factor(Genotype,
+                      levels = c(control_genotype, case_genotypes)),
+    Group = paste0(Genotype, "_", Sex, "_", Age, "M")
+  )
+
+# Auto-build valid comparisons (only pairs present in data)
+available_groups <- unique(metadata$Group)
+
+comp_table <- expand.grid(
+  case_genotype = case_genotypes,
+  sex           = sex_levels,
+  age           = age_groups,
+  stringsAsFactors = FALSE
+) %>%
+  dplyr::mutate(
+    control = paste0(control_genotype, "_", sex, "_", age, "M"),
+    case    = paste0(case_genotype,    "_", sex, "_", age, "M")
+  ) %>%
+  dplyr::filter(
+    control %in% available_groups,
+    case    %in% available_groups
+  ) %>%
+  dplyr::select(control, case)
+
+cat("Valid comparisons:", nrow(comp_table), "\n")
+print(comp_table)
+```
+
+### 4.2 Run DESeq2
+
+```{r run_deseq2, eval=FALSE, echo=TRUE}
+res_deseq <- run_experiment_analysis(
+  counts          = rawcountdata,
+  meta            = metadata,
+  comp_table      = comp_table,
+  target_col      = "Genotype",
+  experiment_name = "RNAseq"
+)
+
+save(res_deseq,
+     file = file.path(result_dir, "DESeq2_Results_RNAseq.RData"))
+cat("DESeq2 results saved.\n")
+```
+
+```{r load_deseq2}
+load(file.path(result_dir, "DESeq2_Results_RNAseq.RData"))
+cat("Models loaded:", length(res_deseq$list), "\n")
+```
+
+### 4.3 DEG Summary Table
+
+```{r deg_summary}
+degs_up   <- purrr::map(res_deseq$list,
+                         ~length(which(.x$padj < deseq2_alpha &
+                                       .x$log2FoldChange > deseq2_lfc_cutoff)))
+degs_down <- purrr::map(res_deseq$list,
+                         ~length(which(.x$padj < deseq2_alpha &
+                                       .x$log2FoldChange < -deseq2_lfc_cutoff)))
+
+deg_summary <- data.frame(
+  comparison = names(degs_up),
+  Up         = as.integer(unlist(degs_up)),
+  Down       = as.integer(unlist(degs_down))
+) %>%
+  dplyr::mutate(Sex = ifelse(grepl("Female", comparison), "Female", "Male"))
+
+deg_summary %>%
+  gt::gt() %>%
+  gt::tab_header(
+    title    = gt::md("**DEG Summary**"),
+    subtitle = gt::md(paste0("FDR < ", deseq2_alpha,
+                              " | |Log2FC| > ", deseq2_lfc_cutoff))
+  ) %>%
+  gt::tab_spanner(label = "Count", columns = c(Up, Down))
+```
+
+### 4.4 DEG Barplot
+
+```{r deg_barplot, fig.width=8, fig.height=6}
+my_colors <- c("Up_DEGs" = "#D55E00", "Down_DEGs" = "#0072B2")
+
+g1 <- deg_summary %>%
+  dplyr::rename(Up_DEGs = Up, Down_DEGs = Down) %>%
+  tidyr::pivot_longer(cols = c(Up_DEGs, Down_DEGs),
+                      names_to = "Group", values_to = "DEGs") %>%
+  dplyr::mutate(
+    comparison = stringr::str_remove_all(comparison, "Female_|Male_")
+  )
+
+barplot_fn(g1)
+```
+
+### 4.5 Volcano Plots
+
+```{r volcano, fig.width=8, fig.height=8}
+for (i in names(res_deseq$list)) {
+  df <- as.data.frame(res_deseq$list[[i]])
+
+  print(
+    EnhancedVolcano::EnhancedVolcano(df,
+      x = "log2FoldChange", y = "padj",
+      lab = df$symbol, title = i, subtitle = "",
+      FCcutoff  = deseq2_lfc_cutoff,
+      pCutoff   = deseq2_alpha,
+      xlim = c(min(df$log2FoldChange, na.rm = TRUE) - 1,
+               max(df$log2FoldChange, na.rm = TRUE) + 1),
+      ylim = c(0, max(-log10(df$padj), na.rm = TRUE) + 2)
+    )
+  )
+}
+```
+
+---
+
+## 5. Functional Analysis — KEGG
+
+Over-representation analysis of DEGs against KEGG pathways using
+`clusterProfiler::compareCluster()`.
+
+```{r kegg, fig.height=9, fig.width=11}
+res_all    <- res_deseq$df
+sig_genes  <- dplyr::filter(res_all, padj < deseq2_alpha)
+sig_groups <- unique(sig_genes$group)
+
+if (length(sig_groups) > 0) {
+  kegg_enrichment_analysis(
+    groups      = sig_groups,
+    deg_results = sig_genes,
+    top_n       = kegg_top_n
+  )
+} else {
+  message("No significant DEGs found for KEGG enrichment.")
+}
+```
+
+---
+
+## 6. Save Processed Results
+
+```{r save_results}
+save(res_deseq, deg_summary,
+     file = file.path(result_dir, "DESeq2_Results_RNAseq.RData"))
+cat("All results saved to:", file.path(result_dir, "DESeq2_Results_RNAseq.RData"), "\n")
+```
+
+---
+
+## Session Info
+
+```{r session_info, echo=TRUE}
+sessionInfo()
+```
