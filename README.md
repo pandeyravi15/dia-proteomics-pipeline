@@ -150,7 +150,7 @@ External reference datasets required for human comparison analyses:
 | AMP-AD sex-stratified modules | AMP-AD Knowledge Portal | 04 | Sex-specific module correlation |
 | BioDomain annotations | [Agora / AMP-AD](https://agora.adknowledgeportal.org) | 02, 04 | GO term → BioDomain mapping |
 | Domain color table | AMP-AD | 02, 04 | BioDomain plot styling |
-| Nikhil et al. AD subtypes | [Rao et al. 2021](https://pubmed.ncbi.nlm.nih.gov/32492070/) | 04 | AD subtype correlation |
+| Milind et al. AD subtypes | [Milind et al. 2021](https://pubmed.ncbi.nlm.nih.gov/32492070/) | 04 | AD subtype correlation |
 | Neff et al. AD subtypes | [Neff et al. 2021](https://pubmed.ncbi.nlm.nih.gov/33523961/) | 04 | AD subtype correlation |
 
 ---
