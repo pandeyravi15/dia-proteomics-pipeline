@@ -327,7 +327,7 @@ Example data contains 20 proteins and 12 samples across 2 genotypes, 2 sexes, an
 
 If you use this pipeline, please cite:
 
-> Pandey RS. Brain Multi-Omics Analysis Pipeline. GitHub: https://github.com/[your-username]/brain-multiomics-pipeline
+> Pandey RS. Brain Multi-Omics Analysis Pipeline. GitHub: https://github.com/pandeyravi15/brain-multiomics-pipeline
 
 And the underlying tools:
 - [DESeq2](https://doi.org/10.1186/s13059-014-0550-8)
@@ -354,4 +354,4 @@ MIT — see [LICENSE](LICENSE) for details.
 ## 📬 Contact
 
 **Ravi S Pandey**  
-GitHub: [@your-username](https://github.com/your-username)
+GitHub: [@pandeyravi15](https://github.com/pandeyravi15)

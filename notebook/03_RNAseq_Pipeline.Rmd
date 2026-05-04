@@ -131,7 +131,7 @@ org_db_obj <- get(organism_db)
 ```
 
 ```{r source_helpers}
-source("../R/Helper_Functions.R")
+source("../R/Helper_Functions_RNA.R")
 ```
 
 ---
